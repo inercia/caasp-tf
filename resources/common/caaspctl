@@ -1,0 +1,1626 @@
+#!/bin/sh
+#
+# Author(s): Alvaro Saurin <alvaro.saurin@suse.com>
+#
+# Copyright (c) 2017 SUSE LINUX GmbH, Nuernberg, Germany.
+#
+# All modifications and additions to the file contributed by third parties
+# remain the property of their copyright owners, unless otherwise agreed
+# upon. The license for this file, and modifications and additions to the
+# file, is the same license as for the pristine package itself (unless the
+# license for the pristine package is not an Open Source License, in which
+# case the license is the MIT License). An "Open Source License" is a
+# license that conforms to the Open Source Definition (Version 1.9)
+# published by the Open Source Initiative.
+#
+
+[ -n "$DEBUG" ] && set -x
+
+CAASPCTL="${BASH_SOURCE[0]}"
+DIR="$( cd "$( dirname "$CAASPCTL" )" && pwd )"
+
+# directory where the CA certificate is stored
+CERT_CA_DIR="/etc/pki"
+
+# where admin certificates will be generated to
+CERT_ADMIN_DIR="/root/certs"
+
+# the name is important, but the IP not so much (as we will
+# use /etc/hosts). This is required since GOLANG does not like
+# self-signed certs without IP SANs.
+REGISTRY_HOSTNAME=${REGISTRY_HOSTNAME:-"dashboard"}
+REGISTRY_PORT=5000
+REGISTRY_IP=${REGISTRY_IP:-}
+REGISTRY="$REGISTRY_HOSTNAME:$REGISTRY_PORT"
+
+# where certificates will be generated to / read from
+REGISTRY_CERTS_DIR="$DIR/certificates.local"
+
+# some Salt options
+SALT_OPTS=${SALT_OPTS:-"--force-color"}
+
+# default orchestration options
+ORCH_OPTS=${ORCH_OPTS:-"-l debug --force-color"}
+ORCH_DEFAULT="kubernetes"
+ORCH_REMOVAL="removal"
+ORCH_ADDITION="addition"
+ORCH_LOG="/tmp/orch.log"
+
+# some key container (partial) names
+CONTAINER_REGISTRY="registry"
+CONTAINER_REGISTRY_TAG="2"
+CONTAINER_SALT_MASTER="salt-master"
+CONTAINER_SALT_API="salt-api"
+CONTAINER_VELUM="velum-dashboard"
+CONTAINER_MARIADB="velum-mariadb"
+
+CONTAINER_START_TIMEOUT=300
+
+# the database we use
+VELUM_DB="velum_production"
+
+# the file where the Salt master hostname/IP is configured
+SALT_MASTER_CONFIG_FILE=/etc/salt/minion.d/master.conf
+
+# default URL for the API server
+API_SERVER_URL="https://api.infra.caasp.local:6443"
+
+# the Rail executable
+RAILS_EXE="/srv/velum/vendor/bundle/ruby/2.1.0/bin/rails"
+
+# vendors accepted by zypper
+ZYPPER_VENDORS="suse,opensuse,obs://build.suse.de,obs://build.opensuse.org"
+
+# the admin user in kubernetes
+K8S_ADMIN_USER="cluster-admin"
+
+# grain used for marking that the node needs to be updated
+UPDATE_GRAIN="tx_update_reboot_needed"
+
+# files with key-value assignements for the pillar (order is important)
+PILLARS_FILES="$(dirname $CAASPCTL)/pillar.lst \
+  $(dirname $CAASPCTL)/pillar-local.lst \
+  $(dirname $CAASPCTL)/pillar.local.lst"
+
+####################################################################
+
+log()        { echo ">>> $1" ; }
+
+# usage: repeated_char "*" 20
+repeated_char() {
+ str=$1
+ num=$2
+ v=$(printf "%-${num}s" "$str")
+ log "${v// /*}"
+}
+
+print_hr()   { repeated_char "*" 80 ; }
+
+log_sys()    { log "$1" ; logger -t "caaspctl" "$1" ; }
+log_sys_hr() { print_hr ; log_sys "$1" ; print_hr ; }
+warn()       { log "WARNING: $1" ; }
+abort()      { log "FATAL: $1" ; exit 1 ; }
+
+# join all the [1:] arguments by the first one
+join_by()    { local IFS="$1"; shift; echo "$*"; }
+
+# return a JSON list from the list of arguments
+as_json_lst() { python -c "import json, sys ; print json.dumps(sys.argv[1:])" $@ | tr -d ' ' ; }
+
+get_regular_container() {
+  docker ps | grep "$1" | awk '{print $1}'
+}
+
+get_container() {
+  get_regular_container "k8s_$1_velum"
+}
+
+get_cid() {
+  name=$1
+  case "$name" in
+    salt-master|salt)
+      get_container "$CONTAINER_SALT_MASTER"
+      ;;
+    velum)
+      get_container "$CONTAINER_VELUM"
+      ;;
+    mariadb|mysql|maria|db)
+      get_container "$CONTAINER_MARIADB"
+      ;;
+    api|salt-api|API)
+      get_container "$CONTAINER_SALT_API"
+      ;;
+    *)
+      get_container "$name"
+      ;;
+  esac
+}
+
+wait_for_container() {
+  local count=0
+  until [ -n "`get_cid $1`" ] ; do
+    left=$((CONTAINER_START_TIMEOUT - count))
+    log "Waiting for container $1 ($left secs left)..."
+    sleep 1
+    [ "$count" -gt "$CONTAINER_START_TIMEOUT" ] && abort "timeout waiting for container $1"
+    count=$((count+1))
+  done
+}
+
+exec_in_container() {
+  # do not expand globs
+  set -f
+
+  local c=$(get_cid $1)
+  [ -n "$c" ] || abort "exec_in_container: could not get $1 container... are you sure it is running here?"
+  shift
+  docker exec "$c" "$@"
+}
+
+restart_container() {
+  c=$(get_cid $1)
+  [ -n "$c" ] || abort "could not get the container $1... are you sure it is running here?"
+  log_sys "Restarting $1 container..."
+  docker restart $c
+}
+
+wait_for_db() {
+  local db=$1
+  local count=0
+  until exec_in_container "$MARIADB_CONTAINER" \
+    bash -c 'mysql -uroot -p`cat $MARIADB_PASS_PATH` -e "show databases"' | \
+    grep "$db" &>/dev/null ; do
+    log "(waiting for database $db...)"
+    sleep 5
+    [ "$count" -gt "$CONTAINER_START_TIMEOUT" ] && abort "timeout waiting for database $db"
+    count=$((count+5))
+  done
+  sleep 20
+  log "Database seems to be present"
+}
+
+# interface with the default route
+default_iface() {
+  /sbin/ip route | awk '/default/ { print $5 }'
+}
+
+# IP for an interface
+iface_ip() {
+  ifconfig $1 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}'
+}
+
+default_iface_ip() {
+  iface_ip `default_iface`
+}
+
+do_reboot() {
+  log "Rebooting $(hostname) - $(cat /etc/machine-id)..."
+  rebootmgrctl reboot
+}
+
+# get the IP address of a (random) master
+get_master_ip() {
+  $CAASPCTL salt \
+    --no-color --log-level critical --out=newline_values_only \
+    -C 'G@roles:kube-master' \
+    network.interface_ip eth0 2>/dev/null | \
+    head -n1
+}
+
+# get the name of a (random) master
+get_master_name() {
+  $CAASPCTL salt --no-color \
+    -C 'G@roles:kube-master' \
+    grains.get caasp_fqdn --out=text 2>/dev/null | \
+    head -n1 | cut -f2 -d" "
+}
+
+get_salt_where_from() {
+  case $1 in
+    "master"|"masters")
+      echo "G@roles:kube-master"
+      ;;
+    "minion"|"minions")
+      echo "G@roles:kube-minion"
+      ;;
+    "nodes"|"workers")
+      echo "P@roles:kube-(master|minion)"
+      ;;
+    *)
+      echo "$1"
+  esac
+}
+
+########################
+# registry
+########################
+
+TMP_REGISTRY_CNF=/tmp/registry-openssl.cnf
+
+CA_CRT="$REGISTRY_CERTS_DIR/ca.pem"
+CA_KEY="$REGISTRY_CERTS_DIR/ca-key.pem"
+CA_CSR="$REGISTRY_CERTS_DIR/ca.csr"
+
+REG_CRT="$REGISTRY_CERTS_DIR/registry.pem"
+REG_KEY="$REGISTRY_CERTS_DIR/registry-key.pem"
+REG_CSR="$REGISTRY_CERTS_DIR/registry.csr"
+
+
+reg_gen_certs() {
+  mkdir -p "$REGISTRY_CERTS_DIR"
+  rm -f "$REG_KEY" "$REG_CRT" "$REG_CSR"
+
+  if [ -z "$REGISTRY_IP" ] ; then
+    REGISTRY_IP=$(default_iface_ip)
+    [ -n "$REGISTRY_IP" ] || abort "could not guess default interface IP"
+  fi
+
+  log "Generating openssl config"
+  echo "[req]" >$TMP_REGISTRY_CNF
+  echo "prompt                      = no" >>$TMP_REGISTRY_CNF
+  echo "req_extensions              = v3_req" >>$TMP_REGISTRY_CNF
+  echo "distinguished_name          = req_distinguished_name" >>$TMP_REGISTRY_CNF
+  echo "[ req_distinguished_name ]" >>$TMP_REGISTRY_CNF
+  echo "countryName                 = US" >>$TMP_REGISTRY_CNF
+  echo "stateOrProvinceName         = Somewhere" >>$TMP_REGISTRY_CNF
+  echo "localityName                = Somewhere" >>$TMP_REGISTRY_CNF
+  echo "organizationName            = SUSE" >>$TMP_REGISTRY_CNF
+  echo "commonName                  = $REGISTRY_HOSTNAME" >>$TMP_REGISTRY_CNF
+  echo "[ v3_req ]" >>$TMP_REGISTRY_CNF
+  echo "basicConstraints            = CA:FALSE" >>$TMP_REGISTRY_CNF
+  echo "keyUsage                    = nonRepudiation, digitalSignature, keyEncipherment" >> $TMP_REGISTRY_CNF
+  echo "subjectAltName              = @alt_names" >>$TMP_REGISTRY_CNF
+  echo "[alt_names]" >>$TMP_REGISTRY_CNF
+  echo "DNS.1                       = $REGISTRY_HOSTNAME.local" >>$TMP_REGISTRY_CNF
+  echo "DNS.2                       = $REGISTRY_HOSTNAME" >>$TMP_REGISTRY_CNF
+  echo "IP.1                        = $REGISTRY_IP" >>$TMP_REGISTRY_CNF
+
+  log "Generating CA"
+  openssl genrsa -out "$CA_KEY" 4096
+  openssl req -new -x509 -days 1826 \
+    -key "$CA_KEY" -out "$CA_CRT" \
+    -config "$TMP_REGISTRY_CNF"
+
+  log "Generating registry's private key"
+  openssl genrsa -out "$REG_KEY" 2048
+
+  log "Generating registry's certificate signing request (CSR)"
+  openssl req -new \
+    -key "$REG_KEY" -out "$REG_CSR" \
+    -subj "/CN=$REGISTRY_HOSTNAME" \
+    -config "$TMP_REGISTRY_CNF"
+
+  log "Signing registry's CSR with CA key"
+  openssl x509 -req \
+    -CA "$CA_CRT" -CAkey "$CA_KEY" \
+    -CAcreateserial \
+    -in "$REG_CSR" -out "$REG_CRT" \
+    -days 365 \
+    -extensions v3_req \
+    -extfile "$TMP_REGISTRY_CNF"
+
+  rm -f "$TMP_REGISTRY_CNF"
+
+  log "Dumping certificate information:"
+  openssl x509 -in "$REG_CRT" -text -noout
+  log "Done. Certificates stored at $REGISTRY_CERTS_DIR"
+}
+
+reg_dump_catalog() {
+  log "Dumping registry catalog"
+  CURL_ARGS=
+  if [ -f "$CA_CRT" ] ; then
+    CURL_ARGS="$CURL_ARGS --cacert $CA_CRT"
+    CATALOG_URL="https://$REGISTRY/v2/_catalog"
+  else
+    CATALOG_URL="http://$REGISTRY/v2/_catalog"
+  fi
+  curl $CURL_ARGS "$CATALOG_URL"
+}
+
+reg_start() {
+  [ -f "$REG_KEY" ] || $CAASPCTL certs
+  [ -f "$REG_KEY" ] || abort "no certificate found at $REG_KEY"
+
+  log "Starting the registry"
+  docker run -d -p $REGISTRY_PORT:$REGISTRY_PORT \
+    --restart=always --name registry \
+    -v $REGISTRY_CERTS_DIR:/certs \
+    -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/$(basename "$REG_CRT") \
+    -e REGISTRY_HTTP_TLS_KEY=/certs/$(basename "$REG_KEY") \
+    $CONTAINER_REGISTRY:$CONTAINER_REGISTRY_TAG
+}
+
+reg_import() {
+  local image_name="$1"
+
+  log "Pulling $image_name"
+  docker pull "$image_name"
+
+  local image_hash=$(docker images | grep "$image_name" | grep latest | awk '{ print $3 }')
+
+  log "Tagging $image_hash as $REGISTRY/$image_name"
+  docker tag "$image_hash" "$REGISTRY/$image_name"
+
+  log "Pushing $REGISTRY/$image_name"
+  docker push "$REGISTRY/$image_name"
+
+  $CAASPCTL registry status
+}
+
+reg_usage() {
+  cat<<EOF
+$(basename $CAASPCTL) registry subcommands:
+
+    certs         generate the certificates
+    start         start the registry
+    stop          stop the registry
+    status        dump the registry catalog
+    import IMAGE  import an image to the registry (ie, "caaspctl reg import alpine")
+
+EOF
+}
+
+reg_command() {
+  local command=$1
+  shift
+  case "$command" in
+    certs)
+      reg_gen_certs
+      ;;
+
+    start)
+      reg_start
+      ;;
+
+    stop)
+      log "Stopping the registry"
+      docker stop registry
+      docker rm registry
+      ;;
+
+    status)
+      reg_container=$(get_regular_container $CONTAINER_REGISTRY)
+      [ -n "$reg_container" ] || abort "no registry seems to be running here"
+      reg_dump_catalog
+      ;;
+
+    import)
+      reg_import $@
+      ;;
+
+    help|-h|--help)
+      reg_usage
+      ;;
+
+    * )
+      reg_usage
+      abort "Unknown command $command"
+      ;;
+  esac
+}
+
+########################
+# Salt apply states
+########################
+
+apply_usage() {
+  cat<<EOF
+$(basename $CAASPCTL) apply subcommands:
+
+    at <WHERE> <STATE> [ARGS ...] apply some state on the machines that match <WHERE>
+    at <WHERE> high [ARGS ...]    apply a "highstate" on the machines that match <WHERE>
+    <STATE> [ARGS ...]            apply some state on all the machines in the cluster
+
+where <STATES> is a comma-separated list of states or SLS files
+               (ie, "haproxy,kubeconfig/pre-update.sls")
+      <WHERE>  is a Salt expression like 'G@roles:admin' or an alias
+               like "masters", "minions", etc
+
+Examples:
+
+    * $(basename $CAASPCTL) apply at "G@roles:ca" haproxy
+    * $(basename $CAASPCTL) apply at minions high pillar='{"foo":"bar"}'
+    * $(basename $CAASPCTL) apply etc-hosts
+    * $(basename $CAASPCTL) apply at 'G@caasp_etcd_member' etcd.remove-pre-stop-services
+
+EOF
+}
+
+apply_command() {
+  # do not expand globs
+  set -f
+  local command=$1
+  shift
+  case "$command" in
+    at)
+      local where=$(get_salt_where_from "${1:-admin}")
+      shift
+      local state="${1:-highstate}"
+      shift
+
+      case "$state" in
+        high|HIGH|highstate|HIGHSTATE|hi|HI|h|H)
+          log_sys_hr "Applying highstate on '$where'"
+          exec_salt -C "$where" state.apply $@
+          ;;
+        *)
+          log_sys_hr "Applying '$state' state on '$where'"
+          exec_salt -C "$where" state.apply "$state" $@
+          ;;
+      esac
+      ;;
+    help|-h|--help)
+      apply_usage
+      ;;
+    *)
+      local args="$command $@"
+      [ -n "$args" ] || abort "No command provided"
+      apply_command at '*' $args
+      ;;
+  esac
+}
+
+########################
+# Salt cmd.run
+########################
+
+cmd_usage() {
+  cat<<EOF
+$(basename $CAASPCTL) cmd subcommands:
+
+    at <WHERE> <CMD>   run a command on the machines that match <WHERE>
+                       (ie, '$CAASPCTL cmd at 'G@roles:admin' systemctl restart docker)
+    <CMD>              run some command on all the machines in the cluster
+                       (ie, '$CAASPCTL cmd ls / etc-hosts)
+
+where <WHERE>  is a Salt expression like 'G@roles:admin' or an alias
+               like "masters", "minions", etc
+
+EOF
+}
+
+cmd_command() {
+  # do not expand globs
+  set -f
+  local command=$1
+  shift
+  case "$command" in
+    at)
+      local where=$(get_salt_where_from "${1:-admin}")
+      shift
+      local cmd="$@"
+      [ -n "$cmd" ] || abort "No command provided"
+      log_sys_hr "Running '$cmd' on '$where'"
+      exec_salt -C "$where" cmd.run "$cmd"
+      ;;
+    help|-h|--help)
+      cmd_usage
+      ;;
+    *)
+      local cmd="$command $@"
+      [ -n "$cmd" ] || abort "No command provided"
+      log_sys_hr "Running '$cmd' in all machines"
+      exec_salt -C '*' cmd.run "$cmd"
+      ;;
+  esac
+}
+
+########################
+# Salt pillar
+########################
+
+pillar_usage() {
+  cat<<EOF
+$(basename $CAASPCTL) pillar subcommands:
+
+    set <PILLAR>=<VALUE>   set a PILLAR
+    get <PILLAR> [<WHERE>] get a pillar PILLAR (in WHERE)
+    ls [<WHERE>]           list all the pillars (in WHERE)
+    items [<WHERE>]        get all the pillars and contents (in WHERE)
+
+where <WHERE>  is a Salt expression like 'G@roles:admin' or an alias
+               like "masters", "minions", etc
+               NOTE: default=admin
+EOF
+}
+
+_pillar_db_insert() {
+  [ $# -eq 2 ] || abort "Wrong number of parameters when setting pillar"
+  log_sys "Adding pillar: '$1' = '$2'"
+  exec_in_db "INSERT INTO pillars (pillar, value) VALUES ('$1', '$2');"
+}
+
+_pillar_db_truncate() {
+  log_sys "Truncating pillars database"
+  exec_in_db "TRUNCATE TABLE pillars;"
+}
+
+do_pillar_add() {
+  # old mechanism: do it through the Velum container... slow
+  #wait_for_container velum
+  #exec_in_container velum \
+    #  entrypoint.sh bundle exec rails runner \
+    #    "pillar = Pillar.find_or_initialize_by(pillar: \"$1\"); pillar.value = \"$2\"; pillar.save"
+
+  wait_for_container db
+  _pillar_db_insert $1 $2
+}
+
+# load a file with pillar assignements lines like "<PILLAR> <VALUE>"
+do_pillar_load_file() {
+  local pillar_lst=$1
+
+  wait_for_container db
+  _pillar_db_truncate
+
+  log "Loading $pillar_lst"
+  cat $pillar_lst | \
+    grep -v "^#" | \
+    grep -v "^$" | \
+    while IFS='' read -r line || [ -n "$line" ] ; do
+    local key=$(echo $line | awk '{ print $1 }')
+    local value=$(echo $line | awk '{ print $2 }')
+    if [ -n "$key" ] ; then
+      _pillar_db_insert "$key" "$value"
+    else
+      warning "Empty key in pillars file"
+    fi
+  done
+  log "$pillar_lst loaded"
+  log "NOTE: a 'salt sync' would be needed now..."
+}
+
+pillar_command() {
+  local command=$1
+  shift
+  case "$command" in
+    set)
+      if [ $# -gt 0 ] ; then
+        for x in $@ ; do
+          do_pillar_add "${x%=*}" "${x#*=}"
+        done
+      else
+        warn "No pillar values to set"
+      fi
+      ;;
+    ls|list)
+      local where=$(get_salt_where_from "${1:-admin}")
+      log "Listing pillars (in '$where')"
+      exec_salt -C "$where" pillar.ls
+      ;;
+    get)
+      local pillar="$1"
+      [ -n "$pillar" ] || abort "no pillar provided"
+      local where=$(get_salt_where_from "${2:-admin}")
+      log "Getting pillar '$pillar' (in '$where')"
+      exec_salt -C "$where" pillar.get "$pillar"
+      ;;
+    items)
+      local where=$(get_salt_where_from "${1:-admin}")
+      log "Listing pillars (in '$where')"
+      exec_salt -C "$where" pillar.items
+      ;;
+    help|-h|--help)
+      pillar_usage
+      ;;
+    * )
+      pillar_usage
+      abort "Unknown pillar command $command"
+      ;;
+  esac
+}
+
+########################
+# Salt grains
+########################
+
+grains_usage() {
+  cat<<EOF
+$(basename $CAASPCTL) grains subcommands:
+
+    set '<WHERE>' <GRAIN>=<VALUE>   set a GRAIN in WHERE
+    ls [<WHERE>]                    list all the grains
+    items [<WHERE>]                 get all the grains and contents
+    refresh                         refresh the grains
+
+where <WHERE>  is a Salt expression like 'G@roles:admin' or an alias
+               like "masters", "minions", etc
+               NOTE: default=admin
+EOF
+}
+
+grains_command() {
+  local command=$1
+  shift
+  case "$command" in
+    set)
+      set -f
+      local where=$(get_salt_where_from "${1:-admin}")
+      local key="${2%=*}"
+      local value="${2#*=}"
+      log "Setting grain $key=$value in $where"
+      exec_salt -C "$where" grains.set "$key" "$value"
+      ;;
+    ls|list)
+      local where=$(get_salt_where_from "${1:-admin}")
+      log "Listing grains (in '$where')"
+      exec_salt -C "$where" grains.ls
+      ;;
+    items)
+      local where=$(get_salt_where_from "${1:-admin}")
+      log "Listing grains (in '$where')"
+      exec_salt -C "$where" grains.items
+      ;;
+    refresh|sync|update)
+      salt_command refresh_grains
+      ;;
+    help|-h|--help)
+      grains_usage
+      ;;
+    * )
+      grains_usage
+      abort "Unknown grains command $command"
+      ;;
+  esac
+}
+
+########################
+# Salt keys
+########################
+
+do_salt_key() {
+  exec_in_salt_master /usr/bin/salt-key --force-color "$@"
+}
+
+get_salt_keys_accepted_num() {
+  do_salt_key -l acc | tail -n +2 | wc -l
+}
+
+# accept all keys and print the number of keys accepted so far
+do_salt_keys_accept_all() {
+  do_salt_key --accept-all --yes &>/dev/null
+  get_salt_keys_accepted_num
+}
+
+wait_for_num_keys_accepted() {
+  local num_keys=$1
+  local count=0
+  until [ `do_salt_keys_accept_all` -ge $num_keys ] ; do
+    left=$((CONTAINER_START_TIMEOUT - count))
+    log "Waiting for $num_keys Salt keys to be accepted: $(get_salt_keys_accepted_num) accepted ($left secs left)..."
+    sleep 5
+    [ "$count" -gt "$CONTAINER_START_TIMEOUT" ] && abort "timeout waiting for $num_keys to be accepted"
+    count=$((count+5))
+  done
+}
+
+keys_usage() {
+  cat<<EOF
+$(basename $CAASPCTL) keys subcommands:
+
+    accept-all          accept all the unaccepted keys
+    accept-wait <NUM>   keep accepting keys until we have <NUM> keys accepted
+    accept <KEY>        accept the key <KEY>
+    delete <KEY>        delete the key <KEY>
+    ls|list             list all the keys
+
+EOF
+}
+
+keys_command() {
+  local command=$1
+  shift
+  case "$command" in
+    accept-all)
+      log_sys_hr "Accepting all unaccepted keys"
+      do_salt_keys_accept_all >/dev/null
+      do_salt_key --list-all $@
+      ;;
+
+    ls|list)
+      do_salt_key --list all
+      ;;
+
+    accept-wait|wait)
+      wait_for_num_keys_accepted $@
+      ;;
+
+    accept)
+      do_salt_key -y -a $@
+      ;;
+
+    delete)
+      do_salt_key -y -d $@
+      ;;
+
+    help|-h|--help)
+      keys_usage
+      ;;
+
+    * )
+      keys_usage
+      abort "Unknown keys command $command"
+      ;;
+  esac
+}
+
+########################
+# Salt keys
+########################
+
+logs_usage() {
+  cat<<EOF
+$(basename $CAASPCTL) logs subcommands:
+
+    salt           dump Salt master logs
+    api            dump Salt API logs
+    velum          dump Velum logs
+    mariadb|db     dump MariaDB logs
+    <CONT>         dump the logs for container <CONT>
+
+    events         show all the Salt events
+    events-failed  show the failed events
+    events-reactor show the events triggered by the reactor
+    events-orch    show the runner.state.orchestrate events
+
+EOF
+}
+
+do_logs_container() {
+  local cid=$(get_cid $1)
+  local name="$2"
+  [ -n "$cid" ] || abort "could not get the $name container... are you sure it is running here?"
+
+  local path=$(docker inspect --format='{{.LogPath}}' $cid)
+  [ -n "$path" ] || abort "could not find the path to logs for $name"
+  log "Dumping $name logs..."
+  cat "$path"
+}
+
+logs_command() {
+  local command=$1
+  shift
+  case "$command" in
+    salt)
+      do_logs_container "salt-master" "Salt master" $@
+      ;;
+
+    api|API)
+      do_logs_container "api" "Salt API" $@
+      ;;
+
+    velum)
+      do_logs_container "velum" "Velum" $@
+      ;;
+
+    mariadb|maria|db|mysql)
+      do_logs_container "mariadb" "MariaDB" $@
+      ;;
+
+    events*)
+      $CAASPCTL db $command $@
+      ;;
+
+    help|-h|--help)
+      logs_usage
+      ;;
+
+    * )
+      [ -z "$command" ] && logs_usage && exit 0
+      do_logs_container "$command" "$command" $@
+      ;;
+  esac
+}
+
+########################
+# kubeconfig
+########################
+
+k8s_kubeconfig() {
+  log "Generating admin certificates"
+
+  local ca_key="$CERT_CA_DIR/private/ca.key"
+  local ca_crt="$CERT_CA_DIR/ca.crt"
+
+  [ -f $ca_key      ] || abort "no ca.key found at $ca_key"
+  [ -f $ca_crt      ] || abort "no ca.crt found at $ca_crt"
+
+  mkdir -p $CERT_ADMIN_DIR
+  cd $CERT_ADMIN_DIR
+
+  rm -f $CERT_ADMIN_DIR/admin.{crt,key}
+  openssl genrsa -out $CERT_ADMIN_DIR/admin.key 2048
+  openssl req -new -key $CERT_ADMIN_DIR/admin.key \
+    -out $CERT_ADMIN_DIR/admin.csr \
+    -subj "/CN=$K8S_ADMIN_USER/O=system:masters"
+  openssl x509 -req -in $CERT_ADMIN_DIR/admin.csr \
+    -CA $ca_crt -CAkey $ca_key -CAcreateserial \
+    -out $CERT_ADMIN_DIR/admin.crt -days 365
+  rm -f $CERT_ADMIN_DIR/admin.csr
+
+  log "Generating a valid kubectl configuration for $API_SERVER_URL"
+  kubectl config set-cluster default-cluster \
+    --embed-certs=true \
+    --server="$API_SERVER_URL" \
+    --certificate-authority="$ca_crt"
+
+  kubectl config set-credentials "$K8S_ADMIN_USER" \
+    --embed-certs=true \
+    --certificate-authority="$ca_crt" \
+    --client-key="$CERT_ADMIN_DIR/admin.key" \
+    --client-certificate="$CERT_ADMIN_DIR/admin.crt"
+
+  kubectl config set-context default-system \
+    --cluster=default-cluster --user="$K8S_ADMIN_USER"
+  kubectl config use-context default-system
+
+  log "Done!"
+  warn "You may need to do:"
+  warn "kubectl create clusterrolebinding cluster-admin-binding --clusterrole=cluster-admin --user=$K8S_ADMIN_USER"
+  warn "in a master machine"
+  log "(you could get the config file from"
+  log "$HOME/.kube/config to some other machine)"
+}
+
+k8s_usage() {
+  cat<<EOF
+$(basename $CAASPCTL) k8s subcommands:
+
+    kubeconfig        generate a kubeconfig file
+    get-apiserver     print the API server hostname
+
+EOF
+}
+
+k8s_command() {
+  local command=$1
+  shift
+  case "$command" in
+    kubeconfig)
+      k8s_kubeconfig
+      ;;
+    get-apiserver|get-master)
+      echo $(get_master_name)
+      ;;
+    help|-h|--help)
+      k8s_usage
+      ;;
+    * )
+      k8s_usage
+      abort "Unknown k8s subcommand $command"
+      ;;
+  esac
+}
+
+########################
+# salt
+########################
+
+# run a command in the Salt master
+exec_in_salt_master() {
+  wait_for_container salt-master
+  exec_in_container salt-master "$@"
+}
+
+exec_salt()     { exec_in_salt_master /usr/bin/salt $SALT_OPTS "$@" ; }
+exec_salt_run() { exec_in_salt_master /usr/bin/salt-run $SALT_OPTS "$@" ; }
+
+salt_usage() {
+  cat<<EOF
+$(basename $CAASPCTL) salt subcommands:
+
+    logs <FLAGS>      dump the Salt master logs (A)
+    events            listen for Salt events (A)
+    sync              synchronize Salt grains, pillar, etc (A)
+    enter             enter the Salt master container (A)
+    restart           restart the Salt Master and API containers (A)
+    restart-api       restart the Salt API container (A)
+    restart-master    restart the Salt master container (A)
+    refresh-pillar    refresh the pillar
+    refresh-grains    refresh the grains
+    set-master <ADDR> set the Salt master address (W)
+    <COMMAND>         run a command like 'salt <COMMAND>' (ie, "$(basename $CAASPCTL) salt '*' test.ping") (A)
+
+(A) only in the Admin Node
+(W) only in Worker Nodes
+
+EOF
+}
+
+do_salt_sync()        { exec_salt "*" saltutil.sync_all refresh=True ; }
+do_salt_sync_pillar() { exec_salt "*" saltutil.sync_pillar refresh=True ; }
+
+salt_command() {
+  set -f
+  local args="$@"
+  local command=$1
+  shift
+  case "$command" in
+    run)
+      exec_salt_run $@
+      ;;
+
+    logs)
+      c=$(get_cid $CONTAINER_SALT_MASTER)
+      [ -n "$c" ] || abort "could not get the Salt master container... are you sure it is running here?"
+      log "Dumping Salt logs..."
+      docker logs $@ $c
+      ;;
+
+    events)
+      log "Dumping Salt events..."
+      exec_salt_run state.event pretty=true
+      ;;
+
+    sync|refresh|update)
+      log_sys_hr "Synchronizing all"
+      do_salt_sync
+      ;;
+
+    refresh_grains|refresh-grains)
+      log_sys "Refreshing grains..."
+      exec_salt "*" saltutil.refresh_grains
+      log_sys "Refresh: done"
+      ;;
+
+    refresh_pillar|refresh-pillar)
+      log_sys "Refreshing pillar..."
+      exec_salt "*" saltutil.refresh_pillar
+      log_sys "Refresh: done"
+      ;;
+
+    enter)
+      log "Entering Salt container..."
+      docker exec -ti $(get_cid $CONTAINER_SALT_MASTER) /bin/sh
+      log "(exited the Salt container)"
+      ;;
+
+    restart)
+      $CAASPCTL salt restart-master
+      $CAASPCTL salt restart-api
+      ;;
+
+    restart-master)
+      restart_container salt-master
+      ;;
+
+    restart-api)
+      restart_container salt-api
+      ;;
+
+    set-master)
+      local new_admin="$1"
+      [ -n "$new_admin" ] || abort "no IP/hostname provided for 'set-master'"
+      local current_admin=$(cat $SALT_MASTER_CONFIG_FILE | cut -f2 -d' ')
+      if [ -z "$current_admin" ] || [ "$current_admin" != "$new_admin" ] ; then
+        echo "master: $new_admin" > $SALT_MASTER_CONFIG_FILE
+        systemctl restart salt-minion
+      fi
+      ;;
+
+    help|-h|--help)
+      salt_usage
+      ;;
+
+    *)
+      # interpret all the args as a Salt command
+      exec_salt $args
+      ;;
+  esac
+}
+
+########################
+# orchestration
+########################
+
+orchestrate_usage() {
+  cat<<EOF
+$(basename $CAASPCTL) orch subcommands:
+
+    prepare                prepare an orchestration, loading pillars and so...
+    orch [ORCH [ARGS ...]] prepare and run an orchestration
+    fast [ORCH [ARGS ...]] just run the orchestration
+    rm <ID>                run the removal orchestration for ID
+    rms <ID>               run the removal orchestration for ID (but skipping it)
+
+where ORCH default value is 'kubernetes'
+
+Examples:
+
+  * for just testing Jinja output
+
+    $(basename $CAASPCTL) orch kubernetes test=True
+
+  * for removing node SOMEID
+
+    $(basename $CAASPCTL) orch rm SOMEID
+
+  * for updating the cluster
+
+    $(basename $CAASPCTL) orch update
+
+  (we can previously set the "fake" update flags with)
+
+    $(basename $CAASPCTL) orch update-set-needed
+
+EOF
+}
+
+do_prepare_orchestration() {
+  log_sys_hr "Preparing orchestration: setting pillars"
+  for pillar_lst in $PILLARS_FILES ; do
+    [ -f $pillar_lst ] && do_pillar_load_file $pillar_lst
+  done
+
+  # some pillars that must be set dynamically
+  log "Setting some dynamic pillars..."
+  local admin_ip=$(default_iface_ip)
+  do_pillar_add "dashboard" "$admin_ip"
+  do_pillar_add "dashboard_external_fqdn" "$admin_ip"
+}
+
+do_orchestrate() {
+  local orchestration=${1:-$ORCH_DEFAULT}
+  shift
+
+  keys_command accept-all
+
+  log_sys_hr "Synchronizing all"
+  do_salt_sync
+
+  log_sys_hr "Starting the '$orchestration' orchestration..."
+  [ $# -gt 0 ] && log_sys "Orchestration arguments: $@"
+  salt_command run $ORCH_OPTS state.orchestrate "orch.$orchestration" $@ | tee $ORCH_LOG
+  log_sys "'$orchestration' orchestration finished"
+}
+
+orchestrate_command() {
+  local command=$1
+  [ -n "$command" ] || command="orchestrate"
+  shift
+  case "$command" in
+
+    prepare)
+      do_prepare_orchestration
+      ;;
+
+    orchestrate-fast|orch-fast|fast)
+      do_orchestrate $@
+      ;;
+
+    orchestrate|orch)
+      $CAASPCTL orchestrate prepare
+      $CAASPCTL orchestrate fast $@
+      ;;
+
+    update-set-needed)
+      log_sys "Setting $UPDATE_GRAIN=true"
+      grains_command set masters $UPDATE_GRAIN=true
+      grains_command set minions $UPDATE_GRAIN=true
+      ;;
+
+    rm)
+      target=$1
+      $CAASPCTL orchestrate $ORCH_REMOVAL pillar='{"target":"'$target'"}'
+      ;;
+
+    rms)
+      target=$1
+      $CAASPCTL orchestrate $ORCH_REMOVAL pillar='{"target":"'$target'","skip":"true"}'
+      ;;
+
+    add)
+      targets_lst=`as_json_lst $@`
+      $CAASPCTL orchestrate $ORCH_ADDITION pillar='{"targets":'$targets_lst'}'
+      ;;
+
+    help|-h|--help)
+      orchestrate_usage
+      ;;
+
+    *)
+      orchestrate_command orch $command $@
+      abort "Unknown orchestration argument $command"
+      ;;
+  esac
+}
+
+########################
+# RW
+########################
+
+rw_command() {
+  local command=$1
+  shift
+  case "$command" in
+    start|enable|true|on|1)
+      log_sys "Making the FS read-writeable"
+      btrfs property set -ts /.snapshots/1/snapshot ro false
+      mount -o remount,rw /
+      ;;
+    stop|disable|false|off|0)
+      warn "not implemented yet"
+      ;;
+    *)
+      abort "Unknown argument $command"
+      ;;
+  esac
+}
+
+########################
+# Velum
+########################
+
+exec_velum_salt_fun() {
+  local fun=$1
+  log "Salt.$fun:"
+  exec_in_container "$CONTAINER_VELUM" \
+    entrypoint.sh bash -c \
+    "$RAILS_EXE runner \"require 'velum/salt'; require 'pp' ; pp(Velum::Salt.$fun)\""
+  log "Salt.$fun done!"
+}
+
+velum_usage() {
+  cat<<EOF
+$(basename $CAASPCTL) velum subcommands:
+
+    enter                enter the Velum container
+    logs                 dump the Velum logs
+    fun <FUNCTION>       run the Salt <FUNCTION>
+
+Orchestrations:
+
+    orch|orchestrate     run the orchestration
+    update               run the update orchestration
+
+Minions:
+
+    minions              get the list of minions
+    accept-minion <ID>   accept a minion
+    pending-minions      get the list of pending minions
+
+EOF
+}
+
+velum_command() {
+  local command=$1
+  shift
+  case "$command" in
+    orch|orchestrate)
+      $CAASPCTL salt refresh
+      exec_velum_salt_fun "orchestrate"
+      ;;
+
+    update)
+      $CAASPCTL salt refresh
+      exec_velum_salt_fun "update_orchestration"
+      ;;
+
+    logs)
+      $CAASPCTL logs velum
+      ;;
+
+    minions)
+      exec_velum_salt_fun "minions"
+      ;;
+
+    pending|pending-minions)
+      exec_velum_salt_fun "pending_minions"
+      ;;
+
+    accept|accept-minion)
+      for i in $@ ; do
+        exec_velum_salt_fun "accept_minion(minion_id: '$i')"
+      done
+      ;;
+
+    fun|function|f|call|run)
+      exec_velum_salt_fun $@
+      ;;
+
+    enter)
+      log "Entering Velum container..."
+      docker exec -ti $(get_cid $CONTAINER_VELUM) /bin/sh
+      log "(exited the Velum container)"
+      ;;
+
+    enter-db|enter-mariadb)
+      log "Entering MariaDB..."
+      local pass=$(cat /var/lib/misc/infra-secrets/mariadb-root-password)
+      docker exec -ti $(get_cid $CONTAINER_MARIADB)  mysql -uroot -p$pass
+      log "(exited MariaDB)"
+      ;;
+
+    help|-h|--help)
+      velum_usage
+      ;;
+
+    * )
+      velum_usage
+      abort "Unknown velum subcommand $command"
+      ;;
+  esac
+}
+
+
+########################
+# Database
+########################
+
+QUERY_EVENTS='SELECT data FROM salt_events ORDER BY alter_time;'
+QUERY_EVENTS_FAILED='SELECT data FROM salt_events WHERE data LIKE "%\"success\": false%" ORDER BY alter_time;'
+QUERY_EVENTS_REACTOR='SELECT data FROM salt_events WHERE data LIKE "%\"user\": \"Reactor\"%" ORDER BY alter_time;'
+QUERY_EVENTS_ORCH='SELECT data FROM salt_events WHERE data LIKE "%\"fun\": \"runner.state.orchestrate\"%" ORDER BY alter_time;'
+
+exec_in_db_raw() {
+  local pass="$(cat /var/lib/misc/infra-secrets/mariadb-root-password)"
+  exec_in_container "$CONTAINER_MARIADB" \
+    mysql -uroot "-p$pass" -B -e "$@" $VELUM_DB
+}
+
+exec_in_db() {
+  local pass="$(cat /var/lib/misc/infra-secrets/mariadb-root-password)"
+  exec_in_container "$CONTAINER_MARIADB" \
+    mysql -uroot "-p$pass" -B -t -e "$@" $VELUM_DB
+}
+
+pretty_print_salt_events() {
+  exec_in_db_raw "$1" | while read line ; do
+    echo '-------------------------------------------------'
+    echo "$line" | python -m json.tool
+  done
+}
+
+db_usage() {
+  cat<<EOF
+$(basename $CAASPCTL) db subcommands:
+
+    enter          enter MariaDB
+    logs           dump the MariaDB container logs
+    pillar         show the Salt pillar
+    minions        show the Minions in the database
+    tables         show the DB tables
+    exec <QUERY>   run a custom query (note: use single quotes)
+
+events queries:
+
+    events         show all the Salt events
+    events-failed  show the failed events
+    events-reactor show the events triggered by the reactor
+    events-orch    show the runner.state.orchestrate events
+
+EOF
+}
+
+db_command() {
+  set -f
+  local command=$1
+  shift
+  case "$command" in
+    enter)
+      log "Entering MariaDB..."
+      local pass=$(cat /var/lib/misc/infra-secrets/mariadb-root-password)
+      docker exec -ti $(get_cid $CONTAINER_MARIADB)  mysql -uroot -p$pass $VELUM_DB
+      log "(exited MariaDB)"
+      ;;
+
+    logs)
+      $CAASPCTL logs db
+      ;;
+
+    pillar)
+      exec_in_db 'SELECT * FROM pillars;'
+      ;;
+
+    tables)
+      exec_in_db 'SHOW TABLES;'
+      ;;
+
+    minions)
+      exec_in_db 'SELECT * FROM minions;'
+      ;;
+
+    events)
+      pretty_print_salt_events "$QUERY_EVENTS"
+      ;;
+
+    events-failed)
+      pretty_print_salt_events "$QUERY_EVENTS_FAILED"
+      ;;
+
+    events-reactor)
+      pretty_print_salt_events "$QUERY_EVENTS_REACTOR"
+      ;;
+
+    events-orch)
+      pretty_print_salt_events "$QUERY_EVENTS_ORCH"
+      ;;
+
+    exec|run|f|fun)
+      exec_in_db $@
+      ;;
+
+    help|-h|--help)
+      db_usage
+      ;;
+
+    * )
+      db_usage
+      abort "Unknown db subcommand $command"
+      ;;
+  esac
+}
+
+########################
+# zypper
+########################
+
+zypper_add_repo() {
+  log "Accepting these vendors: $ZYPPER_VENDORS"
+
+  echo "[main]" > /etc/zypp/vendors.d/vendors.conf
+  echo "vendors = $ZYPPER_VENDORS " >> /etc/zypp/vendors.d/vendors.conf
+
+  log_sys "Running zypper add-repo"
+  zypper ar --refresh --no-gpgcheck $@
+  log_sys "... repo added."
+}
+
+zypper_remove_repo() {
+  log_sys "Running zypper remove-repo"
+  zypper rr $@
+  log_sys "... repo removed."
+}
+
+zypper_update() {
+  log_sys "Diabling the transactional-update timer"
+  systemctl disable --now transactional-update.timer
+
+  log_sys "Downloading CaaSP updates..."
+  transactional-update cleanup dup salt
+  log "... updates downloads done."
+}
+
+zypper_install() {
+  log_sys "Installing package(s): $@"
+  transactional-update pkg install $@
+  log_sys "... package installed."
+}
+
+zypper_usage() {
+  cat<<EOF
+$(basename $CAASPCTL) zypper subcommands:
+
+    add-repo|ar [FLAGS]     add a repo
+    remove-repo|rr [FLAGS]  remove a repo
+    update|up               update the system (it does not reboot it)
+    install|in [PACKAGE]    install a local RPM
+
+EOF
+}
+
+zypper_command() {
+  local command=$1
+  shift
+  case "$command" in
+    add-repo|ar)
+      zypper_add_repo $@
+      ;;
+    remove-repo|rr)
+      zypper_remove_repo $@
+      ;;
+    update|up)
+      zypper_update $@
+      ;;
+    install|in)
+      zypper_install $@
+      ;;
+    help|-h|--help)
+      zypper_usage
+      ;;
+    *)
+      zypper_usage
+      abort "Unknown argument $command"
+      ;;
+  esac
+}
+
+########################
+# activation
+########################
+
+do_activate() {
+  log_sys "Stopping the kubelet"
+  systemctl stop kubelet
+  log_sys "... done!"
+  sleep 2
+
+  log_sys "Stopping all the containers currently running..."
+  docker ps -q | xargs -r docker stop
+  docker ps -q | xargs -r docker kill
+  log_sys "... done!"
+  sleep 2
+
+  log "Fixing permissions"
+  chmod 755 `find /usr/share/caasp-container-manifests -name '*.sh'`
+
+  log_sys "Running activate.sh"
+  /usr/share/caasp-container-manifests/activate.sh
+  log_sys "... done!"
+
+  # TODO: run this iff it has been never run before...
+  #log_sys "Running admin-node-setup.sh"
+  #/usr/share/caasp-container-manifests/admin-node-setup.sh
+  #log_sys "... done!"
+
+  log_sys "Starting kubelet, Salt minion, etc"
+  systemctl start kubelet
+  systemctl start salt-minion
+  log_sys "... done!"
+}
+
+########################
+# main
+########################
+
+usage() {
+  cat<<EOF
+$(basename $CAASPCTL) usage: subcommands:
+
+Salt:
+
+    salt               run a Salt command
+    orchestrate|orch   run a Salt orchestration (default: $ORCH_DEFAULT)
+    apply              apply Salt states
+    cmd                run a command in the cluster with the help of "cmd.run"
+    pillar|vars        modoify/query Salt pillars (variables)
+    grains             operate on the Salt grains
+    keys               operate on the Salt keys
+
+Kubernetes/Docker:
+
+    k8s                kubernetes-specific commands
+    registry|reg       create/manage a local Docker registry
+    exec <CONT> <CMD>  run a command in a container
+    cid <CONT>         get a container ID
+    wait <CONT>        wait for a container
+    enter <CONT>       get a shell in a container
+
+    (where <CONT> can be an alias like 'salt-master', 'velum', etc)
+
+CaaSP/MicroOS:
+
+    velum              operate on Velum
+    db                 operate on the database
+    activate           run the activation procedure
+    logs               dump logs
+
+OS commands:
+
+    rw|RW              modify the RW status of the filesystem
+    zypper             manage packages, repos, updates...
+    reboot             reboot the machine
+
+Misc:
+
+    help               print this help message
+
+EOF
+
+  if ls $CAASPCTL-* 1> /dev/null 2>&1; then
+    echo "Other undocumented subcommands (invoke with --help for more details):"
+    echo
+    for i in $CAASPCTL-* ; do
+      echo "   " ${i#$CAASPCTL-}
+    done
+    echo
+  fi
+}
+
+[ $# -eq 0 ] && usage && abort "No subcommand provided"
+
+command=$1
+shift
+case "$command" in
+  salt)
+    set -f
+    salt_command "$@"
+    ;;
+
+  velum)
+    velum_command "$@"
+    ;;
+
+  db)
+    db_command "$@"
+    ;;
+
+  orchestrate|orch)
+    orchestrate_command "$@"
+    ;;
+
+  apply)
+    set -f
+    apply_command "$@"
+    ;;
+
+  cmd)
+    set -f
+    cmd_command "$@"
+    ;;
+
+  pillar|vars)
+    pillar_command "$@"
+    ;;
+
+  grains)
+    grains_command "$@"
+    ;;
+
+  keys|key)
+    keys_command "$@"
+    ;;
+
+  exec)
+    exec_in_container "$@"
+    ;;
+
+  cid)
+    get_cid "$@"
+    ;;
+
+  wait)
+    wait_for_container "$@"
+    ;;
+
+  enter)
+    docker exec -ti $(get_cid $1) /bin/sh
+    ;;
+
+  k8s|kubernetes|kube)
+    k8s_command "$@"
+    ;;
+
+  logs)
+    logs_command "$@"
+    ;;
+
+  zypper)
+    zypper_command "$@"
+    ;;
+
+  rw|RW)
+    rw_command "$@"
+    ;;
+
+  registry|reg)
+    reg_command "$@"
+    ;;
+
+  activate)
+    do_activate "$@"
+    ;;
+
+  reboot)
+    do_reboot
+    ;;
+
+  help|-h|--help)
+    usage
+    ;;
+
+  *)
+    # extend the usage of caaspctl with other tools (ie, "caaspctl-dns")
+    if [ -e "$CAASPCTL-$command.local" ] ; then
+      sh "$CAASPCTL-$command.local" "$@"
+    elif [ -e "$CAASPCTL-$command" ] ; then
+      sh "$CAASPCTL-$command" "$@"
+    else
+      usage
+      abort "Unknown command $command"
+    fi
+    ;;
+esac
+
+exit 0

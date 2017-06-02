@@ -1,0 +1,10 @@
+# A remote host running libvirt
+# eg: an host with more than 8GB or RAM
+#libvirt_uri = "qemu+ssh://root@arrakis/system"
+
+# A custom pool defined on the libvirt host
+# eg: a pool backed by a fast SSD
+#img_pool = "home_libvirtd"
+
+# The latest version of the CaaSP image:
+#img_src = "http://download.suse.de/ibs/SUSE:/SLE-12-SP2:/Update:/Products:/CASP10/images/"

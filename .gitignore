@@ -1,0 +1,25 @@
+# terraform files
+*.tfstate*
+/*.tfvars
+.terraform/   
+
+*.local
+*local.tf
+*local.sh
+
+pillar.lst
+
+# files from profiles
+/profile-*.tf
+
+# some generated files
+*.log
+*.crt
+*.key
+*.rpm
+
+# dowloaded files
+*.qcow2
+docker-images/
+e2e-images.lst
+kubeconfig

@@ -1,0 +1,72 @@
+#!/bin/sh
+#
+# Author(s): Alvaro Saurin <alvaro.saurin@suse.com>
+#
+# Copyright (c) 2017 SUSE LINUX GmbH, Nuernberg, Germany.
+#
+# All modifications and additions to the file contributed by third parties
+# remain the property of their copyright owners, unless otherwise agreed
+# upon. The license for this file, and modifications and additions to the
+# file, is the same license as for the pristine package itself (unless the
+# license for the pristine package is not an Open Source License, in which
+# case the license is the MIT License). An "Open Source License" is a
+# license that conforms to the Open Source Definition (Version 1.9)
+# published by the Open Source Initiative.
+#
+
+CAASPCTL_RESTART="${BASH_SOURCE[0]}"
+DIR="$( cd "$( dirname "$CAASPCTL_RESTART" )" && pwd )"
+CAASPCTL="$DIR/caaspctl"
+
+####################################################################
+
+log()     { echo ">>> $1" ; }
+log_sys() { log "$1" ; logger -t "caaspctl" "$1" ; }
+warn()    { log "WARNING: $1" ; }
+abort()   { log "FATAL: $1" ; exit 1 ; }
+
+########################
+# main
+########################
+
+cmd="$1"
+shift
+[ -z "$cmd" ] && abort "no subcommand provided when invoking $(basename $CAASPCTL)"
+
+case "$cmd" in
+    salt)
+        $CAASPCTL salt restart
+        ;;
+
+    salt-master)
+        $CAASPCTL salt restart-master
+        ;;
+
+    salt-api|api)
+        $CAASPCTL salt restart-api
+        ;;
+
+    master)
+        log "Restarting k8s master"
+        systemctl restart kube-apiserver
+        systemctl restart kube-controller-manager
+        systemctl restart kube-scheduler
+        ;;
+
+    minion)
+        log "Restarting k8s minion"
+        systemctl restart kubelet
+        systemctl restart kube-proxy
+        ;;
+
+    etcd)
+        log "Restarting etcd"
+        systemctl stop etcd
+        rm -rf /var/lib/etcd/*
+        systemctl start etcd
+        ;;
+
+    *)
+        abort "Unknown argument '$1'"
+        ;;
+esac

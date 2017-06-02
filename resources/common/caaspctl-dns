@@ -1,0 +1,110 @@
+#!/bin/sh
+#
+# Author(s): Alvaro Saurin <alvaro.saurin@suse.com>
+#
+# Copyright (c) 2017 SUSE LINUX GmbH, Nuernberg, Germany.
+#
+# All modifications and additions to the file contributed by third parties
+# remain the property of their copyright owners, unless otherwise agreed
+# upon. The license for this file, and modifications and additions to the
+# file, is the same license as for the pristine package itself (unless the
+# license for the pristine package is not an Open Source License, in which
+# case the license is the MIT License). An "Open Source License" is a
+# license that conforms to the Open Source Definition (Version 1.9)
+# published by the Open Source Initiative.
+#
+
+CAASPCTL_DNS="${BASH_SOURCE[0]}"
+DIR="$( cd "$( dirname "$CAASPCTL_DNS" )" && pwd )"
+CAASPCTL="$DIR/caaspctl"
+
+#
+ETC_HOSTS="/etc/hosts"
+
+####################################################################
+
+log()     { echo ">>> $1" ; }
+log_sys() { log "$1" ; logger -t "caaspctl" "$1" ; }
+warn()    { log "WARNING: $1" ; }
+abort()   { log "FATAL: $1" ; exit 1 ; }
+
+########################
+# /etc/hosts management
+########################
+
+etchosts_add() {
+    local name=$1
+    local ip=$2
+
+    [ -n "$name" ] || abort "no name provided when invoking $(basename $CAASPCTL) dns add"
+    [ -n "$ip"   ] || abort "no IP provided when invoking $(basename $CAASPCTL) dns add $name"
+
+    log_sys "Adding $name"
+    HOSTS_LINE="$ip    $name"
+    if [ -n "$(grep $name /etc/hosts)" ] ; then
+            log_sys "$name already exists: $(grep $name $ETC_HOSTS)"
+    else
+        log "Adding a new $name=$ip entry to your $ETC_HOSTS"
+        echo "$HOSTS_LINE" >> $ETC_HOSTS
+
+        if [ -n "$(grep $name $ETC_HOSTS)" ] ; then
+            log_sys "$name was added succesfully. New line: $(grep $name $ETC_HOSTS)"
+        else
+            warn "ERROR: failed to add $name to $ETC_HOSTS, Try again!"
+        fi
+    fi
+}
+
+etchosts_del() {
+    local name=$1
+
+    [ -n "$name" ] || abort "no name provided when invoking $(basename $CAASPCTL) dns del"
+
+    log_sys "Removing $name (if present)"
+    if [ -n "$(grep $name $ETC_HOSTS)" ] ; then
+        log_sys "$name found: removing..."
+        sed -i".bak" "/$name/d" $ETC_HOSTS
+    fi
+}
+
+etchosts_usage() {
+    cat<<EOF
+$(basename $CAASPCTL) dns usage: subcommands:
+
+        add <host> <ip>
+        del <host>
+        set <host> <ip>
+
+EOF
+}
+
+########################
+# main
+########################
+
+cmd="$1"
+shift
+[ -z "$cmd" ] && etchosts_usage && abort "no subcommand provided when invoking $(basename $CAASPCTL_DNS)"
+
+name="$1"
+ip="$2"
+
+case "$cmd" in
+    add)
+        etchosts_add "$name" "$ip"
+        ;;
+
+    del)
+        etchosts_del "$name"
+        ;;
+
+    set)
+        etchosts_del "$name"
+        etchosts_add "$name" "$ip"
+        ;;
+
+    *)
+        etchosts_usage && abort "Unknown argument $1"
+        ;;
+esac
+
