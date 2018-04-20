@@ -82,6 +82,8 @@ PILLARS_FILES="$(dirname $CAASPCTL)/pillar.lst \
   $(dirname $CAASPCTL)/pillar-local.lst \
   $(dirname $CAASPCTL)/pillar.local.lst"
 
+PYTHON_EVENTS_PROC=$CAASPCTL-events-proc
+
 ####################################################################
 
 log()        { echo ">>> $1" ; }
@@ -758,11 +760,9 @@ $(basename $CAASPCTL) logs subcommands:
     velum          dump Velum logs
     mariadb|db     dump MariaDB logs
     <CONT>         dump the logs for container <CONT>
-
     events         show all the Salt events
-    events-failed  show the failed events
-    events-reactor show the events triggered by the reactor
-    events-orch    show the runner.state.orchestrate events
+
+    (run $(basename $CAASPCTL) logs events --help for more details)
 
 EOF
 }
@@ -1249,9 +1249,6 @@ velum_command() {
 ########################
 
 QUERY_EVENTS='SELECT data FROM salt_events ORDER BY alter_time;'
-QUERY_EVENTS_FAILED='SELECT data FROM salt_events WHERE data LIKE "%\"success\": false%" ORDER BY alter_time;'
-QUERY_EVENTS_REACTOR='SELECT data FROM salt_events WHERE data LIKE "%\"user\": \"Reactor\"%" ORDER BY alter_time;'
-QUERY_EVENTS_ORCH='SELECT data FROM salt_events WHERE data LIKE "%\"fun\": \"runner.state.orchestrate\"%" ORDER BY alter_time;'
 
 exec_in_db_raw() {
   local pass="$(cat /var/lib/misc/infra-secrets/mariadb-root-password)"
@@ -1266,29 +1263,25 @@ exec_in_db() {
 }
 
 pretty_print_salt_events() {
-  exec_in_db_raw "$1" | while read line ; do
-    echo '-------------------------------------------------'
-    echo "$line" | python -m json.tool
-  done
+  local expr=$1
+  shift
+
+  exec_in_db_raw "$expr" | python -c "$PYTHON_FILTER_JID" $@
 }
 
 db_usage() {
   cat<<EOF
 $(basename $CAASPCTL) db subcommands:
 
-    enter          enter MariaDB
-    logs           dump the MariaDB container logs
-    pillar         show the Salt pillar
-    minions        show the Minions in the database
-    tables         show the DB tables
-    exec <QUERY>   run a custom query (note: use single quotes)
+    enter            enter MariaDB
+    logs             dump the MariaDB container logs
+    pillar           show the Salt pillar
+    minions          show the Minions in the database
+    tables           show the DB tables
+    exec <QUERY>     run a custom query (note: use single quotes)
+    events           show all the Salt events
 
-events queries:
-
-    events         show all the Salt events
-    events-failed  show the failed events
-    events-reactor show the events triggered by the reactor
-    events-orch    show the runner.state.orchestrate events
+    (run $(basename $CAASPCTL) db events --help for more details)
 
 EOF
 }
@@ -1322,19 +1315,7 @@ db_command() {
       ;;
 
     events)
-      pretty_print_salt_events "$QUERY_EVENTS"
-      ;;
-
-    events-failed)
-      pretty_print_salt_events "$QUERY_EVENTS_FAILED"
-      ;;
-
-    events-reactor)
-      pretty_print_salt_events "$QUERY_EVENTS_REACTOR"
-      ;;
-
-    events-orch)
-      pretty_print_salt_events "$QUERY_EVENTS_ORCH"
+      exec_in_db_raw "$QUERY_EVENTS" | python $PYTHON_EVENTS_PROC --infile-lines $@
       ;;
 
     exec|run|f|fun)

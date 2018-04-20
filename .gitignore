@@ -11,6 +11,8 @@ pillar.lst
 
 # files from profiles
 /profile-*.tf
+profiles/local.tfvars
+profiles/tupperware.tfvars
 
 # some generated files
 *.log
@@ -23,3 +25,5 @@ pillar.lst
 docker-images/
 e2e-images.lst
 kubeconfig
+
+

@@ -140,22 +140,20 @@ resource "libvirt_domain" "admin" {
   memory    = "${var.admin_memory}"
   cloudinit = "${libvirt_cloudinit.admin.id}"
 
-  cpu {
-    feature {
-      policy = "require"
-      name   = "pcid"
-    }
-  }
+  #cpu {
+  #  feature {
+  #    policy = "require"
+  #    name   = "pcid"
+  #  }
+  #}
 
   disk {
     volume_id = "${libvirt_volume.admin.id}"
   }
-
   network_interface {
     network_name   = "default"
     wait_for_lease = 1
   }
-
   graphics {
     type        = "vnc"
     listen_type = "address"

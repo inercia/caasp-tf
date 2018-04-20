@@ -28,16 +28,12 @@
 # prefix for all the resources'
 PREFIX            = caasp
 
-# pool used for images in libvirt
-LIBVIRT_POOL_NAME = personal
-LIBVIRT_POOL_DIR  = ~/.libvirt/images
-
 # some dis
-CHECKOUTS_DIR     = ~/Development
-SALT_DIR          = $(CHECKOUTS_DIR)/SUSE/k8s-salt
+CHECKOUTS_DIR     = $(CURDIR)/..
+SALT_DIR          = $(CHECKOUTS_DIR)/salt
 SALT_VM_DIR       = /usr/share/salt/kubernetes
-E2E_TESTS_RUNNER  = $(CHECKOUTS_DIR)/SUSE/automation/k8s-e2e-tests/e2e-tests
-MANIFESTS_DIR     = $(CHECKOUTS_DIR)/SUSE/caasp-container-manifests
+E2E_TESTS_RUNNER  = $(CHECKOUTS_DIR)/automation/k8s-e2e-tests/e2e-tests
+MANIFESTS_DIR     = $(CHECKOUTS_DIR)/caasp-container-manifests
 
 # the kubernetes sources checkout
 K8S_SRC_DIR       = $(CHECKOUTS_DIR)/go/src/github.com/kubernetes/kubernetes
@@ -54,9 +50,11 @@ CAASPCTL_DNS      = sudo ./resources/common/caaspctl-dns
 # the directory with resources that will be copied to the VMs
 RESOURCES_DIR    = resources
 
-VARS_CAASP_DEVEL = profiles/devel/images-caasp-devel.tfvars
-VARS_CAASP_2_0   = profiles/devel/images-caasp-2.0.tfvars
-VARS_CAASP_3_0   = profiles/devel/images-caasp-3.0.tfvars
+# some configurations (ie, values for terraform variables)
+CFG_CAASP_DEVEL         = devel/images-caasp-devel
+CFG_CAASP_DEVEL_REMOTE  = devel/images-caasp-devel-remote
+CFG_CAASP_2_0           = devel/images-caasp-2.0
+CFG_CAASP_3_0           = devel/images-caasp-3.0
 
 # a repo for updates
 REPO_UPDATES_2_0 = http://download.suse.de/ibs/Devel:/CASP:/Head:/ControllerNode/standard/
@@ -66,16 +64,6 @@ RUN_CAASPCTL     = bash $(CAASPCTL)
 
 RUN_VIRSH        = sudo virsh
 
-# environment variables we always pass to Terraform
-# can be overwritten from command line with TF_VAR_XXX
-TF_VAR_prefix    = $(PREFIX)
-TF_VAR_img_pool  = $(LIBVIRT_POOL_NAME)
-TF_VAR_salt_dir  = $(SALT_DIR)
-TERRAFORM_VARS   = TF_VAR_prefix=$(TF_VAR_prefix) \
-	                 TF_VAR_img_pool=$(TF_VAR_img_pool) \
-	                 TF_VAR_salt_dir=$(TF_VAR_salt_dir)
-#	                 TF_VAR_manifests_dir=$(MANIFESTS_DIR)
-
 # common options for ssh, rsync, etc
 SSH              = sshpass -p "linux" ssh
 SCP              = sshpass -p "linux" scp
@@ -83,12 +71,16 @@ SSH_OPTS         = -oStrictHostKeyChecking=no \
                    -oUserKnownHostsFile=/dev/null
 EXCLUDE_ARGS     = --exclude='*.tfstate*' \
                    --exclude='.git*' \
-                   --exclude='Makefile' \
                    --exclude='README.md' \
                    --exclude='*.sublime*' \
                    --exclude='.idea' \
                    --exclude='.pyc' \
-                   --exclude='*.tgz'
+									 --exclude='.terraform' \
+                   --exclude='*.tgz' \
+									 --exclude='*.qcow2' \
+									 --exclude='*.rpm' \
+									 --exclude='docker-image*.tar.gz'
+
 RSYNC_OPTS       = $(EXCLUDE_ARGS) \
                    -e '$(SSH) $(SSH_OPTS)' \
                    --delete --delete-after --force
@@ -128,7 +120,7 @@ API_HOSTNAME     = api.infra.caasp.local
 -include Makefile.local
 
 ####################################################################
-# CAASP
+# cluster creation
 ####################################################################
 
 all: dev-help
@@ -156,45 +148,75 @@ dev-help:
 	@echo "IMPORTANT: check the paths in this Makefile before running anything!"
 	@echo "           you can overwrite them in a local Makefile.local"
 
-dev-apply-with-args:
-	@echo ">>> Applying Terraform..."
-	@echo ">>> (with args: $(TERRAFORM_VARS)"
-	@env $(TERRAFORM_VARS) terraform apply $(ARGS)
-	@echo ">>> (Waiting for nodes before snapshotting...)" && \
-			make dev-wait-nodes-accepted _wait-20s dev-snapshot STAGE="post-apply"
+dev-apply-with-args: _dev-enable-ksm
+	@echo "### Applying Terraform..."
+	@echo "### (with args:        $(ARGS) )"
+	@[ -d .terraform ] || terraform init
+	@terraform apply $(ARGS)
+	@echo "### (Waiting for nodes before snapshotting...)"
+	@stage=$(STAGE) ; \
+			make dev-wait-nodes-accepted _wait-20s dev-snapshot STAGE="$${stage:-"post-apply"}"
 
 dev-apply:
-	make dev-apply-with-args
+	make dev-apply-with-args ARGS=$(ARGS)
+
+# you can do things like:
+#
+# make dev-apply-cfgs CFGS='devel/caasp-devel tests/removal no-refresh'
+#
+dev-apply-configurations:
+	@var_args="" ; for i in $(CFGS) ; do \
+	  vars_file=profiles/$$i.tfvars ; \
+		[ -f $$vars_file ] || { echo "ERROR: $$vars_file does not exist" ; exit 1 ; } ; \
+		var_args="$$var_args -var-file=$$vars_file" ; \
+	done ; \
+	make -e dev-apply-with-args ARGS="$$var_args $(ARGS)"
+
+dev-apply-cfgs: dev-apply-configurations
+
 dev-apply-caasp-devel:
-	make dev-apply-with-args ARGS="-var-file=$(VARS_CAASP_DEVEL) $(ARGS)"
+	make dev-apply-cfgs CFGS="$(CFG_CAASP_DEVEL) $(CFGS)" ARGS=$(ARGS)
+
 dev-apply-caasp-devel-big:
-	make dev-apply-caasp-devel ARGS="-var-file=profiles/devel/big-cluster.tfvars"
+	make dev-apply-devel CFGS="devel/big-cluster $(CFGS)" ARGS=$(ARGS)
+
 dev-apply-caasp-2.0:
-	make dev-apply-with-args ARGS="-var-file=$(VARS_CAASP_2_0) $(ARGS)"
+	make dev-apply-cfgs CFGS="$(CFG_CAASP_2_0) $(CFGS)" ARGS=$(ARGS)
+
 dev-apply-caasp-3.0:
-	make dev-apply-with-args ARGS="-var-file=$(VARS_CAASP_3_0) $(ARGS)"
+	make -e dev-apply-with-args CFGS="$(CFG_CAASP_3_0) $(CFGS)" ARGS=$(ARGS)
 
 dev-destroy: dev-destroy-snapshots
-	-terraform destroy -force
+	-[ -f terraform.tfstate ] && terraform destroy -force
 	-rm -f $(CLEANUP_FILES)
 	-@notify-send "k8s: cluster destruction finished" &>/dev/null
 
-dev-copy-resources:
+####################################################################
+# copies
+####################################################################
+
+dev-copy-resources-admin:
 	# there is no need for making the FS rw-able
-	-@for ip in $(ALL_IPS) ; do \
-		echo ">>> Copying '$(RESOURCES_DIR)' to $$ip:/tmp/caasp" ; \
+	@echo "### Copying '$(RESOURCES_DIR)' to $(ADMIN_IP):/tmp/caasp"
+	@rsync -avz $(RSYNC_OPTS) $(RESOURCES_DIR)/common/ root@$(ADMIN_IP):/tmp/caasp/
+	@rsync -avz $(RSYNC_OPTS) $(RESOURCES_DIR)/admin/  root@$(ADMIN_IP):/tmp/caasp/admin/
+
+dev-copy-resources: dev-copy-resources-admin
+	# there is no need for making the FS rw-able
+	-@for ip in $(NODES_IPS) ; do \
+		echo "### Copying '$(RESOURCES_DIR)' to $$ip:/tmp/caasp" ; \
 		rsync -avz $(RSYNC_OPTS) $(RESOURCES_DIR)/common/ root@$$ip:/tmp/caasp/ ; \
 		rsync -avz $(RSYNC_OPTS) $(RESOURCES_DIR)/admin/  root@$$ip:/tmp/caasp/admin/ ; \
 	done
 
 dev-copy-salt:
-	@echo ">>> Making fs RW-able"
+	@echo "### Making fs RW-able"
 	@make dev-ssh CMD='$(RUN_CAASPCTL) rw on'
-	@echo ">>> Copying the Salt scripts/pillar"
+	@echo "### Copying the Salt scripts/pillar"
 	rsync -avz $(RSYNC_OPTS) $(SALT_DIR)/  root@$(ADMIN_IP):$(SALT_VM_DIR)/
 
 dev-copy: dev-copy-resources dev-copy-salt
-	@echo ">>> Synchronizing Salt stuff"
+	@echo "### Synchronizing Salt stuff"
 	@make -s dev-ssh CMD='$(RUN_CAASPCTL) salt sync'
 
 # wait for all the nodes to be accepted by the Salt master
@@ -206,6 +228,10 @@ dev-wait-nodes-accepted:
 	  echo "Waiting for $$nn nodes to be accepted (including 'admin' and 'ca')" && \
 		make -s dev-ssh CMD="$(RUN_CAASPCTL) keys wait $$nn"
 
+
+####################################################################
+# orchestrations
+####################################################################
 
 dev-orch-help:
 	@echo
@@ -234,25 +260,28 @@ dev-orch-help:
 	@echo "IMPORTANT: check the paths in this Makefile before running anything!"
 	@echo "           you can overwrite them in a local Makefile.local"
 
-dev-orch: dev-copy-resources dev-copy-salt dev-wait-nodes-accepted dev-kubeconfig-clean
-	@echo ">>> Running orchestration"
+dev-orch: _dev-enable-ksm dev-copy-resources dev-copy-salt dev-wait-nodes-accepted dev-kubeconfig-clean
+	@echo "### Running orchestration"
 	@make -s dev-ssh CMD='$(RUN_CAASPCTL) orchestrate $(CMD_ARGS)'
 	-@notify-send "k8s: cluster orchestration finished" &>/dev/null
-	[ -n "$(SNAPSHOT)" ] && make dev-snapshot STAGE="post-orch"
+	@stage=$(STAGE) ; \
+	if [ -n "$(SNAPSHOT)" ] ; then \
+		make -s dev-snapshot STAGE=$${stage:-"post-orch"} ; \
+	fi
 
 dev-orch-prepare: dev-wait-nodes-accepted
-	@make -s dev-orch CMD_ARGS='prepare $(CMD_ARGS)'
+	@make -s dev-orch CMD_ARGS='prepare $(CMD_ARGS)' SNAPSHOT=
 
 # run the update orchestration
 # note that nodes must have the tx_update_reboot_needed flag set
 dev-orch-update:
-	@make -s dev-orch CMD_ARGS='update $(CMD_ARGS)'
+	@make -s dev-orch CMD_ARGS='update $(CMD_ARGS)' STAGE="post-update"
 
 # set the tx_update_reboot_needed in all the nodes
 # and start an update orchestration
 dev-orch-update-fake:
-	@make -s dev-orch CMD_ARGS='update-set-needed'
-	@make -s dev-orch CMD_ARGS='update $(CMD_ARGS)'
+	@make -s dev-orch CMD_ARGS='update-set-needed' SNAPSHOT=
+	@make -s dev-orch-update
 
 # remove a node from the cluster
 #
@@ -268,19 +297,19 @@ dev-orch-update-fake:
 #
 dev-orch-rm:
 	@if [ -n '$(NAME)' ] ; then \
-	  echo ">>> Finding machine-id for $(NAME)" ; \
+	  echo "### Finding machine-id for $(NAME)" ; \
 		ID=`make -s dev-machine-id TO=$(NAME)` ; \
-		echo ">>> ... ID=$$ID" ; \
+		echo "### ... ID=$$ID" ; \
 	else \
 		ID=$(ID) ; \
 	fi ; \
 	[ -n "$$ID" ] || (echo "no node ID provided. run with ID or NAME parameters" ; exit 1 ; ) ; \
-	echo ">>> Removing node with ID=$$ID" ; \
+	echo "### Removing node with ID=$$ID" ; \
 	if [ -n '$(SKIP)' ] ; then \
-  	echo ">>> (skipping $$ID in the removal)" ; \
-	  make -s dev-orch CMD_ARGS="rms $$ID $(CMD_ARGS)" ; \
+  	echo "### (skipping $$ID in the removal)" ; \
+	  make -s dev-orch CMD_ARGS="rms $$ID $(CMD_ARGS)" STAGE="post-rm" ; \
 	else \
-	  make -s dev-orch CMD_ARGS="rm $$ID $(CMD_ARGS)" ; \
+	  make -s dev-orch CMD_ARGS="rm $$ID $(CMD_ARGS)" STAGE="post-rm" ; \
 	fi
 
 # add nodes to the cluster
@@ -297,17 +326,17 @@ dev-orch-rm:
 dev-orch-add:
 	@if [ -n '$(NAMES)' ] ; then \
 	  IDS= ; \
-	  echo ">>> Finding machine-id for $(NAMES)" ; \
+	  echo "### Finding machine-id for $(NAMES)" ; \
 		for name in $(NAMES) ; do \
 			IDS="$$IDS `make -s dev-machine-id TO=$$name`" ; \
 		done ; \
-		echo ">>> ... IDS=$$IDS" ; \
+		echo "### ... IDS=$$IDS" ; \
 	else \
 		IDS=$(IDS) ; \
 	fi ; \
 	[ -n "$$IDS" ] || (echo "no node IDS provided. run with IDS or NAMES parameters" ; exit 1 ; ) ; \
-	echo ">>> Adding nodes with IDS=$$IDS" ; \
-  make -s dev-orch CMD_ARGS="add $$IDS $(CMD_ARGS)" ; \
+	echo "### Adding nodes with IDS=$$IDS" ; \
+  make -s dev-orch CMD_ARGS="add $$IDS $(CMD_ARGS)" STAGE="post-add" ; \
 
 dev: dev-apply dev-orch
 
@@ -318,11 +347,15 @@ dev-reorch-update-fake: dev-rollback _wait-20s dev-fix-nodes dev-orch-update-fak
 dev-reorch-rm:          dev-rollback _wait-20s dev-fix-nodes dev-orch-rm
 dev-reorch-add:         dev-rollback _wait-20s dev-fix-nodes dev-orch-add
 
+
+####################################################################
 # highstates
+####################################################################
+
 # use, for example, CMD_ARGS='kube-apiserver' for applying 'kube-apiserver/init.sls' only
 dev-high: dev-copy
 	@[ -n "$(WHERE)" ] || { echo "no WHERE provided, for example: make dev-high WHERE='G@roles:admin'" ; exit 1 ; }
-	@echo ">>> Running highstate at $(WHERE)"
+	@echo "### Running highstate at $(WHERE)"
 	make -s dev-ssh CMD='$(RUN_CAASPCTL) apply at "$(WHERE)" $(CMD_ARGS)'
 	-@notify-send "k8s: highstate at $(WHERE) finished" &>/dev/null
 dev-high-admin:
@@ -346,17 +379,17 @@ dev-restart-k8s-minions:
 # some times we might need to refresh data
 # and readjust some stuff (ie, when IPs change)
 dev-refresh:
-	@echo ">>> Refreshing Terraform data"
+	@echo "### Refreshing Terraform data"
 	@support/mk/refresh-vms.sh
 
 dev-kubeconfig: $(KUBECONFIG)
 $(KUBECONFIG):
-	@echo ">>> Generating a kubeconfig"
+	@echo "### Generating a kubeconfig"
 	@make -s dev-ssh CMD='$(RUN_CAASPCTL) k8s kubeconfig'
-	@echo ">>> Getting the kubeconfig"
+	@echo "### Getting the kubeconfig"
 	@$(SCP) -q $(SSH_OPTS) root@$(ADMIN_IP):.kube/config $(KUBECONFIG)
-	@echo ">>> ... kubeconfig has been copied locally!."
-	@echo ">>> Adding $(API_HOSTNAME) to /etc/hosts"
+	@echo "### ... kubeconfig has been copied locally!."
+	@echo "### Adding $(API_HOSTNAME) to /etc/hosts"
 	$(CAASPCTL_DNS) add $(API_HOSTNAME) $(MASTER_IP)
 
 dev-kubeconfig-clean:
@@ -364,20 +397,21 @@ dev-kubeconfig-clean:
 	rm -f $(KUBECONFIG)
 
 dev-install-dashboard: $(KUBECONFIG)
-	@echo ">>> Installing the dashboard"
+	@echo "### Installing the dashboard"
 	kubectl --kubeconfig=$(KUBECONFIG) apply -f "https://raw.githubusercontent.com/kubernetes/dashboard/master/src/deploy/recommended/kubernetes-dashboard.yaml"
-	@echo ">>> Running the kubectl proxy for http://127.0.0.1:8001/ui/"
+	@echo "### Running the kubectl proxy for http://127.0.0.1:8001/ui/"
 	kubectl --kubeconfig=$(KUBECONFIG) proxy
 
 ####################################################################
 # profiles
+####################################################################
 
 dev-profile-apply: dev-profile-clean
-	@echo ">>> Applying development profile"
+	@echo "### Applying development profile"
 	@for i in profiles/devel/profile-devel*.tf ; do ln -sf $$i ; done
 
 dev-profile-clean:
-	@echo ">>> Cleaning profile files"
+	@echo "### Cleaning profile files"
 	@for i in *.tf ; do \
 		if [ -L $$i ] ; then \
 			l=`readlink $$i` ; \
@@ -387,6 +421,7 @@ dev-profile-clean:
 
 ####################################################################
 # updates & reboots
+####################################################################
 
 # for testing upgrades:
 #
@@ -414,15 +449,15 @@ dev-profile-clean:
 #   make dev-rollback dev-orch-update
 
 dev-nodes-set-reboot-needed:
-	@echo ">>> Setting reboot-needed grain"
+	@echo "### Setting reboot-needed grain"
 	@make -s dev-ssh-nodes CMD='sed -i "/^tx_update_reboot_needed/ d" /etc/salt/grains ; echo "tx_update_reboot_needed: true" >> /etc/salt/grains'
-	@echo ">>> Refreshing grains"
+	@echo "### Refreshing grains"
 	@make -s dev-ssh CMD='$(RUN_CAASPCTL) salt "*" saltutil.refresh_grains'
 
 dev-nodes-update-packages:
-	@echo ">>> Installing a repo with updates"
+	@echo "### Installing a repo with updates"
 	@make -s dev-ssh-nodes CMD="$(RUN_CAASPCTL) zypper ar $(REPO_UPDATES_2_0) updates"
-	@echo ">>> Doing a 'zypper update'"
+	@echo "### Doing a 'zypper update'"
 	@make -s dev-ssh-nodes CMD='$(RUN_CAASPCTL) zypper update'
 	-@notify-send "k8s: cluster updates downloaded... would need a reboot" &>/dev/null
 
@@ -432,6 +467,7 @@ dev-nodes-reboot:
 
 ####################################################################
 # some ssh convencience targets
+####################################################################
 
 dev-ssh-to:
 	@[ -n '$(TO)' ] || (echo "no TO provided" ; exit 1 ; )
@@ -467,29 +503,49 @@ dev-machine-id:
 	@make -s dev-ssh-to CMD='cat /etc/machine-id' TO=`$(PARSE_TFSTATE) --name $(TO)`
 
 ####################################################################
-# some logging utilities
-dev-logs-salt-master:
-	@echo ">>> Dumping logs from the Salt master"
-	@make -s dev-ssh CMD='$(RUN_CAASPCTL) salt logs'
+# logging utilities
+####################################################################
+dev-logs: dev-copy-resources-admin
+	@echo "### Dumping logs"
+	@make -s dev-ssh CMD='$(RUN_CAASPCTL) salt logs $(CMD_ARGS)'  2>&1
 
-dev-logs-events:
-	@echo ">>> Dumping Salt events at the master"
-	@make -s dev-ssh CMD='$(RUN_CAASPCTL) salt events'
+dev-events: dev-copy-resources-admin
+	@echo "### Dumping Salt events"
+	@make -s dev-ssh CMD='$(RUN_CAASPCTL) db events $(CMD_ARGS)' 2>&1 | \
+	    /usr/bin/source-highlight -s json -f esc256
+
+dev-events-csv:
+	@echo "### Dumping Salt events (as CSV)"
+	@make -s dev-ssh CMD='$(RUN_CAASPCTL) db events' | \
+		grep -v '^#' | \
+		./resources/common/caaspctl-events-proc --outfile-csv $(CMD_ARGS)
+
+dev-events-plot:
+	@echo "### Dumping Salt events (as plot)"
+	@make -s dev-ssh CMD='$(RUN_CAASPCTL) db events' | \
+		grep -v '^#' | \
+		./resources/common/caaspctl-events-proc --outfile-plot=plot.png $(CMD_ARGS)
+
+dev-watch: dev-copy-resources-admin
+	@echo "### Listening to Salt events"
+	@make -s dev-ssh CMD='$(RUN_CAASPCTL) salt events $(CMD_ARGS)'  2>&1
+
 
 ####################################################################
 # VMs management
+####################################################################
 
 VMS_SNAPSHOTS = $(VM_ADMIN) $(VM_NODES)
 
 _do-snapshot:
-	@echo ">>> Snapshotting VMs..."
+	@echo "### Snapshotting VMs..."
 	@sleep 5
 	@for vm in $(VMS_SNAPSHOTS) ; do \
 	  if [ -n "$(STAGE)" ] ; then \
-			echo ">>> ... snapshotting $$vm (as stage $(STAGE))" ; \
+			echo "### ... snapshotting $$vm (as stage $(STAGE))" ; \
 			$(RUN_VIRSH) snapshot-create-as --domain "$$vm" --name "$(STAGE)" --description "Snapshot created at $(STAGE)" ; \
 		else \
-			echo ">>> ... snapshotting $$vm" ; \
+			echo "### ... snapshotting $$vm" ; \
 			$(RUN_VIRSH) snapshot-create --domain "$$vm" ; \
 		fi ; \
 	done
@@ -507,22 +563,22 @@ dev-snapshot-list:
 
 dev-destroy-snapshots:
 	-@for vm in $(VMS_SNAPSHOTS) ; do \
-		echo ">>> Destroying snapshots for $$vm" ; \
+		echo "### Destroying snapshots for $$vm" ; \
 		while $(RUN_VIRSH) snapshot-delete --current --domain "$$vm" &>/dev/null ; do /bin/true ; done ; \
 	done
 
 dev-suspend:
-	@echo ">>> Suspending VMs"
+	@echo "### Suspending VMs"
 	-@for vm in $(VMS_SNAPSHOTS) ; do \
-		echo ">>> ... suspending $$vm" ; \
+		echo "### ... suspending $$vm" ; \
 		$(RUN_VIRSH) suspend --domain "$$vm" ; \
 	done
 	-@notify-send "k8s: all VMs suspended" &>/dev/null
 
 dev-resume:
-	@echo ">>> Resuming VMs"
+	@echo "### Resuming VMs"
 	-@for vm in $(VMS_SNAPSHOTS) ; do \
-		echo ">>> ... resuming $$vm" ; \
+		echo "### ... resuming $$vm" ; \
 		$(RUN_VIRSH) resume --domain "$$vm" ; \
 	done
 	-@notify-send "k8s: all VMs suspended" &>/dev/null
@@ -532,18 +588,25 @@ dev-resume:
 # NOTE: better to suspend before rolling back, so minions do
 #       talk to a master that comes from the past
 dev-rollback: dev-suspend
-	@echo ">>> Rolling back VMs"
-	@for vm in $(VMS_SNAPSHOTS) ; do \
+	@echo "### Rolling back VMs"
+	@args="--current" ; \
+	[ -z "$$PAUSED" ] && args="$$args --running" ; \
+	for vm in $(VMS_SNAPSHOTS) ; do \
 	  snap=`$(RUN_VIRSH) snapshot-list $$vm | tail -n2 | awk '{ print $1 }'` ; \
-		echo ">>> ... rolling back: $$vm -> $$snap" ; \
-		$(RUN_VIRSH) snapshot-revert --current --running --domain "$$vm" ; \
+		echo "### ... rolling back: $$vm -> $$snap" ; \
+		$(RUN_VIRSH) snapshot-revert $$args --domain "$$vm" ; \
 	done
 	@sleep 5
-	-@make -s dev-refresh
+	-@[ -z "$$PAUSED" ] && make -s dev-refresh
 	-@notify-send "k8s: VMs rolled back" &>/dev/null
+
+dev-rollback-suspended:
+	@echo "### Rolling back VMs but leaving suspended"
+	@make -s dev-rollback PAUSED=1
 
 ####################################################################
 # packages installation
+####################################################################
 
 _install-rpms-on:
 	@echo "Copying RPMs to $(NODE)"
@@ -565,6 +628,7 @@ dev-install-rpms-nodes:
 
 ####################################################################
 # e2e tests
+####################################################################
 
 # running the e2e tests:
 #
@@ -588,37 +652,48 @@ dev-install-rpms-nodes:
 e2e_images_lst_file = $(E2E_IMAGES_DIR)/e2e-images.lst
 
 $(e2e_images_lst_file):
-	@echo ">>> Generating images list from sources"
-	@echo ">>> WARNING: make sure it is in the right branch !!!"
+	@echo "### Generating images list from sources"
+	@echo "### WARNING: make sure it is in the right branch !!!"
 	grep -Iiroh "gcr.io/google_.*" $(K8S_SRC_DIR)/test/e2e | \
 		sed -e "s/[,\")}]//g" | awk '{print $1}' | \
 		sort | uniq | tr '\n' ' ' > $(e2e_images_lst_file)
 
 dev-e2e-upload-images: $(e2e_images_lst_file)
-	@echo ">>> Downloading and saving images" ; \
+	@echo "### Downloading and saving images" ; \
 	env OUT_DIR=$(E2E_IMAGES_DIR) ./support/mk/save-images.sh `cat $(e2e_images_lst_file)`
 	@-for node in $(NODES_IPS) ; do \
-		echo ">>> Copying images to $$node" ; \
+		echo "### Copying images to $$node" ; \
 		rsync -avz -c $(RSYNC_OPTS) $(E2E_IMAGES_DIR)/docker-image-*  root@$$node:/tmp/ ; \
 		$(SSH) -q $(SSH_OPTS) root@$$node 'sh for i in /tmp/docker-image-* ; do docker load -i $i ; done' ; \
-		echo ">>> ... images copies to $$node" ; \
+		echo "### ... images copies to $$node" ; \
 	done
-	@echo ">>> Loading images in nodes"
+	@echo "### Loading images in nodes"
 	@make -s dev-ssh-nodes CMD='ls /tmp/docker-image*gz | xargs -n1 docker load -i'
 
 # run the e2e tests
 dev-e2e: $(KUBECONFIG)
-	@echo ">>> Running the kubernetes e2e tests"
-	@echo ">>> WARNING: assuming e2e images have been pre-pulled !!!"
+	@echo "### Running the kubernetes e2e tests"
+	@echo "### WARNING: assuming e2e images have been pre-pulled !!!"
 	$(E2E_TESTS_RUNNER) --kubeconfig $(KUBECONFIG) $(E2E_ARGS)
 	-@notify-send "k8s: e2e tests finished" &>/dev/null
 
 ####################################################################
 # aux
+####################################################################
+
+.PHONY: _dev-enable-ksm
+_dev-enable-ksm:
+	@curr_sharing=$(cat /sys/kernel/mm/ksm/pages_sharing) ; \
+	if [ "$curr_sharing" = "0" ] ; then \
+	  echo "### Enabling KSM..." ; \
+		sudo ./support/mk/enable-ksm.sh ; \
+	else  \
+	  echo "### ( KSM seems to be OK! )" ; \
+	fi
 
 .PHONY: _wait-20s
 _wait-20s:
-	@echo ">>> Waiting some time..."
+	@echo "### Waiting some time..."
 	@sleep 20
 
 # hack for fixing things
@@ -631,19 +706,45 @@ dev-fix-nodes:
 	done
 
 ####################################################################
-# other
+# remote targets
+####################################################################
 
-dev-tupperware-plan:
-	terraform plan -var-file=profiles/devel/tupperware-big-cluster.tfvars
+_dev-remote-target:
+	@[ -n "$(REMOTE)" ] || (echo "no REMOTE host provided" ; exit 1 ; )
+	@echo "### Doing a 'make $(TARGET)' at $(REMOTE)"
+	@$(SSH) $(SSH_OPTS) $(REMOTE) 'cd /tmp/caasp-build/caasp-tf && make $(TARGET)'
 
-dev-tupperware-apply:
-	terraform apply -var-file=profiles/devel/tupperware-big-cluster.tfvars
+dev-copy-remote:
+	@[ -n "$(REMOTE)" ] || (echo "no REMOTE host provided" ; exit 1 ; )
+	@echo "### Creating remote build dir at $(REMOTE)"
+	@$(SSH) -q $(SSH_OPTS) $(REMOTE) 'mkdir -p /tmp/caasp-build'
+	@echo "### Copying the Salt repo"
+	@rsync -avz $(RSYNC_OPTS) $(SALT_DIR)/  $(REMOTE):/tmp/caasp-build/salt/
+	@echo "### Copying the TF repo"
+	@rsync -avz $(RSYNC_OPTS) ./  $(REMOTE):/tmp/caasp-build/caasp-tf/
 
-dev-tupperware-destroy:
-	terraform destroy -var-file=profiles/devel/tupperware-big-cluster.tfvars
+dev-apply-caasp-devel-remote: dev-copy-remote
+	make -s _dev-remote-target TARGET="dev-apply-cfgs CFGS='$(REMOTE) devel/images-caasp-devel $(CFGS)'"
+
+dev-orch-remote: dev-copy-remote
+	@make -s _dev-remote-target TARGET="dev-orch"
+
+dev-refresh-remote: dev-copy-remote
+	@make -s _dev-remote-target TARGET="dev-refresh"
+
+dev-snapshot-remote: dev-copy-remote
+	@make -s _dev-remote-target TARGET="dev-snapshot"
+
+dev-snapshot-list-remote: dev-copy-remote
+	@make -s _dev-remote-target TARGET="dev-snapshot-list"
+
+dev-destroy-remote:
+	@make -s _dev-remote-target TARGET="dev-destroy"
+	@$(SSH) -q $(SSH_OPTS) $(REMOTE) 'rm -rf /tmp/caasp-build/caasp-tf/terraform.tfstate*'
 
 ####################################################################
 # distribution
+####################################################################
 
 dist:
 	@echo "Creating distribution package"
