@@ -1,0 +1,41 @@
+devel enable salt=True manifests=False
+
+cluster tfvars no-refresh
+cluster tfvars images-2.0
+
+stage apply
+print ###############################################
+print # creating cluster
+print ###############################################
+
+cluster create
+sleep 30
+
+# wait for nodes to be accepted
+salt wait
+ctl minions accepted
+sleep 30
+
+cluster snapshot stage="post-create"
+sleep 30
+
+stage orch
+print ###############################################
+print # bootstrapping
+print ###############################################
+cluster rollback
+
+# make sure the salt-minion is up and running
+ssh nodes "systemctl restart salt-minion"
+
+# check nodes->dashboard connectivity before going further
+# (this will abort the script if it fails)
+ssh nodes "ping -c1 dashboard"
+
+# run the regular bootstrap orchestration
+salt wait
+orch boot
+sleep 30
+
+cluster snapshot stage="post-orch", description="Orchestration has been run"
+sleep 30

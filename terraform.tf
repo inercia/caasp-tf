@@ -34,6 +34,12 @@ variable "img_url_base" {
   description = "URL to the CaaSP KVM image used for the Admin node"
 }
 
+variable "img_src_filename" {
+  type        = "string"
+  default     = ""
+  description = "Force a specific filename"
+}
+
 variable "img" {
   type        = "string"
   default     = "images/2.0/caasp.qcow2"
@@ -45,6 +51,11 @@ variable "img_refresh" {
   description = "Try to get the latest image (true/false)"
 }
 
+variable "img_down_extra_args" {
+  default     = ""
+  description = "Extra arguments for the images downloader"
+}
+
 variable "nodes_count" {
   default     = 2
   description = "Number of non-admin nodes to be created"
@@ -54,6 +65,12 @@ variable "prefix" {
   type        = "string"
   default     = "caasp"
   description = "a prefix for resources"
+}
+
+variable "network" {
+  type        = "string"
+  default     = "default"
+  description = "an existing network to use for the VMs"
 }
 
 variable "password" {
@@ -98,16 +115,8 @@ resource "null_resource" "download_caasp_image" {
   count = "${length(var.img_url_base) == 0 ? 0 : 1}"
 
   provisioner "local-exec" {
-    command = "./support/tf/download-image.sh --src ${var.img_url_base} --refresh ${var.img_refresh} --local ${var.img}"
+    command = "./support/tf/download-image.sh --src-base ${var.img_url_base} --refresh ${var.img_refresh} --local ${var.img} --upload-to-img ${var.prefix}_base_${basename(var.img)} --upload-to-pool ${var.img_pool} ${var.img_down_extra_args}"
   }
-}
-
-# CaaSP kvm image (created by IBS)
-resource "libvirt_volume" "base_image" {
-  name       = "${var.prefix}_base_${basename(var.img)}"
-  source     = "${var.img}"
-  pool       = "${var.img_pool}"
-  depends_on = ["null_resource.download_caasp_image"]
 }
 
 ##############
@@ -115,9 +124,10 @@ resource "libvirt_volume" "base_image" {
 ##############
 
 resource "libvirt_volume" "admin" {
-  name           = "${var.prefix}_admin.qcow2"
-  pool           = "${var.img_pool}"
-  base_volume_id = "${libvirt_volume.base_image.id}"
+  name             = "${var.prefix}_admin.qcow2"
+  pool             = "${var.img_pool}"
+  base_volume_name = "${var.prefix}_base_${basename(var.img)}"
+  depends_on       = ["null_resource.download_caasp_image"]
 }
 
 data "template_file" "admin_cloud_init_user_data" {
@@ -151,7 +161,7 @@ resource "libvirt_domain" "admin" {
     volume_id = "${libvirt_volume.admin.id}"
   }
   network_interface {
-    network_name   = "default"
+    network_name   = "${var.network}"
     wait_for_lease = 1
   }
   graphics {
@@ -169,10 +179,11 @@ resource "libvirt_domain" "admin" {
 ###########################
 
 resource "libvirt_volume" "node" {
-  count          = "${var.nodes_count}"
-  name           = "${var.prefix}_node_${count.index}.qcow2"
-  pool           = "${var.img_pool}"
-  base_volume_id = "${libvirt_volume.base_image.id}"
+  count            = "${var.nodes_count}"
+  name             = "${var.prefix}_node_${count.index}.qcow2"
+  pool             = "${var.img_pool}"
+  base_volume_name = "${var.prefix}_base_${basename(var.img)}"
+  depends_on       = ["null_resource.download_caasp_image"]
 }
 
 data "template_file" "node_cloud_init_user_data" {
@@ -207,7 +218,7 @@ resource "libvirt_domain" "node" {
   }
 
   network_interface {
-    network_name   = "default"
+    network_name   = "${var.network}"
     wait_for_lease = 1
   }
 

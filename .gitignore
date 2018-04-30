@@ -3,6 +3,10 @@
 /*.tfvars
 .terraform/   
 
+caasp.rc
+caasprc
+.caasprc
+
 *.local
 *local.tf
 *local.sh
@@ -11,8 +15,8 @@ pillar.lst
 
 # files from profiles
 /profile-*.tf
-profiles/local.tfvars
-profiles/tupperware.tfvars
+/terraform-outputs.tf
+/terraform/local.tfvars
 
 # some generated files
 *.log

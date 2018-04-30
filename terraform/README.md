@@ -34,7 +34,7 @@ invoke Terraform with some _variables file(s)_, ie:
 
 ```bash
 cd $PROJECT_ROOT_DIR 
-terraform apply -var-file=profiles/devel/images-staging-b.tfvars
+terraform apply -var-file=profiles/images-staging-b.tfvars
 ```
 
 ## Removing this profile

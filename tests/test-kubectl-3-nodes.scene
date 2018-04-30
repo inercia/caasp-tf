@@ -1,0 +1,9 @@
+print "Checking all nodes can get the list of nodes"
+test cmd_at node-0 kubectl get nodes
+test cmd_at node-1 kubectl get nodes
+test cmd_at node-2 kubectl get nodes
+
+print "Checking all nodes see 3 nodes alive"
+test cmd_at node-0 [ \$(kubectl get nodes | grep caasp-node | grep -v NotReady | wc -l) -eq 3 ]
+test cmd_at node-1 [ \$(kubectl get nodes | grep caasp-node | grep -v NotReady | wc -l) -eq 3 ]
+test cmd_at node-2 [ \$(kubectl get nodes | grep caasp-node | grep -v NotReady | wc -l) -eq 3 ]

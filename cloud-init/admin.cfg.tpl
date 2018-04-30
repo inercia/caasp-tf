@@ -36,7 +36,7 @@ ntp:
 runcmd:
   - /usr/bin/systemctl enable --now ntpd
   - sed -i -e 's/DHCLIENT_SET_HOSTNAME="yes"/DHCLIENT_SET_HOSTNAME="no"/g' /etc/sysconfig/network/dhcp
-
+  
 # enable and run the SUSE CaaSP administrative dashboard
 #runcmd:
 #  - [ sh, -c, /usr/share/caasp-container-manifests/activate.sh ]

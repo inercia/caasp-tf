@@ -101,7 +101,7 @@ resource "null_resource" "copy_resources_admin" {
   # fix permissions, add the tools dir to the path
   provisioner "remote-exec" {
     inline = [
-      "chmod 755 /tmp/caasp/caaspctl /tmp/caasp/*.sh /tmp/caasp/*/*.sh &>/dev/null || /bin/true",
+      "chmod 755 /tmp/caasp/caaspctl /tmp/caasp/caaspctl* /tmp/caasp/*/*.sh &>/dev/null || /bin/true",
       "echo 'export PATH=$PATH:/tmp/caasp:/tmp/caasp/admin' >> /root/.bashrc",
     ]
   }
@@ -125,7 +125,7 @@ resource "null_resource" "copy_manifests" {
 
   provisioner "remote-exec" {
     inline = [
-      "sh /tmp/caasp/caaspctl rw on",
+      "/tmp/caasp/caaspctl rw enable",
       "rm -rf /usr/share/caasp-container-manifests",
     ]
   }
@@ -133,6 +133,13 @@ resource "null_resource" "copy_manifests" {
   provisioner "file" {
     source      = "${pathexpand(var.manifests_dir)}"
     destination = "/usr/share/caasp-container-manifests"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod 755 usr/share/caasp-container-manifests/*.sh",
+      "sh /usr/share/caasp-container-manifests/admin-node-setup.sh",
+    ]
   }
 }
 
@@ -166,7 +173,7 @@ resource "null_resource" "copy_resources_nodes" {
   # fix permissions, add the tools dir to the path
   provisioner "remote-exec" {
     inline = [
-      "chmod 755 /tmp/caasp/caaspctl /tmp/caasp/*.sh /tmp/caasp/*/*.sh &>/dev/null || /bin/true",
+      "chmod 755 /tmp/caasp/caaspctl /tmp/caasp/caaspctl* /tmp/caasp/*/*.sh &>/dev/null || /bin/true",
       "echo 'export PATH=$PATH:/tmp/caasp:/tmp/caasp/nodes' >> /root/.bashrc",
     ]
   }
@@ -191,7 +198,7 @@ resource "null_resource" "add_zypper_repo_admin" {
 
   provisioner "remote-exec" {
     inline = [
-      "sh /tmp/caasp/caaspctl zypper ar -n --no-gpg-checks -Gf ${var.repo_admin_url} extra",
+      "/tmp/caasp/caaspctl zypper ar -n --no-gpg-checks -Gf ${var.repo_admin_url} extra",
     ]
   }
 }
@@ -207,7 +214,7 @@ resource "null_resource" "add_zypper_repo_nodes" {
 
   provisioner "remote-exec" {
     inline = [
-      "sh /tmp/caasp/caaspctl zypper ar -n --no-gpg-checks -Gf ${var.repo_nodes_url} extra",
+      "/tmp/caasp/caaspctl zypper ar -n --no-gpg-checks -Gf ${var.repo_nodes_url} extra",
     ]
   }
 }
@@ -232,7 +239,7 @@ resource "null_resource" "copy_salt" {
 
   provisioner "remote-exec" {
     inline = [
-      "sh /tmp/caasp/caaspctl rw on",
+      "/tmp/caasp/caaspctl rw enable",
       "rm -rf /usr/share/salt/kubernetes",
     ]
   }
@@ -293,7 +300,7 @@ resource "null_resource" "set_pillars" {
 
   provisioner "remote-exec" {
     inline = [
-      "sh /tmp/caasp/caaspctl pillar set ${var.pillar}",
+      "/tmp/caasp/caaspctl pillar set ${var.pillar}",
     ]
   }
 }
@@ -358,7 +365,7 @@ resource "null_resource" "set_dashboard_host_admin" {
 
   provisioner "remote-exec" {
     inline = [
-      "sh /tmp/caasp/caaspctl dns add dashboard 127.0.0.1",
+      "/tmp/caasp/caaspctl etchosts add dashboard 127.0.0.1",
     ]
   }
 }
@@ -374,7 +381,7 @@ resource "null_resource" "set_dashboard_host_nodes" {
 
   provisioner "remote-exec" {
     inline = [
-      "sh /tmp/caasp/caaspctl dns add dashboard ${libvirt_domain.admin.network_interface.0.addresses.0}",
+      "/tmp/caasp/caaspctl etchosts add dashboard ${libvirt_domain.admin.network_interface.0.addresses.0}",
     ]
   }
 }
@@ -400,7 +407,7 @@ resource "null_resource" "activate" {
 
   provisioner "remote-exec" {
     inline = [
-      "sh /tmp/caasp/caaspctl activate",
+      "/tmp/caasp/caaspctl activate",
     ]
   }
 }
@@ -431,11 +438,11 @@ resource "null_resource" "registry" {
   # nodes_count+2 (because of "ca" and "admin") keys to be accepted
   provisioner "remote-exec" {
     inline = [
-      "sh /tmp/caasp/caaspctl registry certs",
+      "/tmp/caasp/caaspctl registry certs",
       "echo '--- Certificate at /tmp/caasp/certificates.local/ca.pem' --- ",
       "cat /tmp/caasp/certificates.local/ca.pem",
-      "sh /tmp/caasp/caaspctl registry start",
-      "sh /tmp/caasp/caaspctl registry import alpine",
+      "/tmp/caasp/caaspctl registry start",
+      "/tmp/caasp/caaspctl registry import alpine",
     ]
   }
 }
@@ -467,8 +474,8 @@ resource "null_resource" "orchestrate" {
   # nodes_count+2 (because of "ca" and "admin") keys to be accepted
   provisioner "remote-exec" {
     inline = [
-      "sh /tmp/caasp/caaspctl keys accept-wait ${var.nodes_count + 2}",
-      "sh /tmp/caasp/caaspctl orchestrate",
+      "/tmp/caasp/caaspctl minions accept ${var.nodes_count + 2}",
+      "/tmp/caasp/caaspctl orch boot",
     ]
   }
 }

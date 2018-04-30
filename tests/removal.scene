@@ -1,0 +1,50 @@
+print ##################################################
+print # test that we can
+print # 1. remove a node
+print # 2. remove a node when some other node is down
+print ##################################################
+
+devel enable
+
+cluster tfvars tests/removal
+
+load tests/orchestration-simple.scene
+
+stage orch-rm
+print ###############################################
+print # first test: regular removal
+print ###############################################
+cluster rollback
+sleep 30
+
+orch rm caasp-node-2
+sleep 30
+
+# check if the kubectl is fine
+# orch kubeconfig
+
+stage test1-tests
+load tests/test-kubectl-3-nodes.scene
+
+print "Test that node-2 key has been rejected"
+test cmd_at admin "caaspctl minions rejected | grep {% get_machine_id('caasp-node-2') %}"
+
+stage orch-rm-minion-down
+print ###############################################
+print # second test: removal with a node down
+print ###############################################
+cluster rollback
+sleep 30
+
+ssh run caasp-node-1 systemctl stop salt-minion
+orch rm caasp-node-2
+sleep 30
+
+# check if the kubectl is fine
+# orch kubeconfig
+
+stage test2-tests
+load tests/test-kubectl-3-nodes.scene
+
+print "Test that node-2 key has been rejected"
+test cmd_at admin "caaspctl minions rejected | grep {% get_machine_id('caasp-node-2') %}"

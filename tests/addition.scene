@@ -1,0 +1,55 @@
+quiet
+devel enable
+
+print ###############################################
+print # first stage: start with some nodes
+print ###############################################
+
+cluster tfvars no-refresh
+cluster tfvars images-devel
+cluster tfvars tests/addition-stage-1
+
+cluster create
+sleep 30
+cluster snapshot stage="post-create"
+sleep 30
+
+stage boot
+print ###############################################
+print # bootstrapping
+print ###############################################
+cluster rollback
+sleep 30
+
+orch boot
+sleep 30
+cluster snapshot stage="post-orch"
+sleep 30
+
+stage add-nodes
+print ###############################################
+print # second stage: add more nodes
+print ###############################################
+cluster rollback
+sleep 30
+
+cluster flush
+cluster tfvars no-refresh
+cluster tfvars local
+cluster tfvars images-devel
+cluster tfvars tests/addition-stage-2
+
+cluster create
+sleep 30
+cluster snapshot stage="post-add-2-pre-orch"
+sleep 30
+
+orch add caasp-node-2 caasp-node-3
+sleep 30
+
+# check if the kubectl reports the new nodes
+
+orch kubeconfig
+
+stage test2-tests
+load test-kubectl-3-nodes.scene

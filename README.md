@@ -16,7 +16,7 @@ These are the most important ones:
 
   * `libvirt_uri`: by default this points to localhost, however it's possible
     to perform the deployment on a different libvirt machine. More on that later.
-  * `img_src`: this is the URL of **a directory** where the CaaSP image 
+  * `img_src`: this is the URL of **a directory** where the CaaSP image
     can be found for creating the whole cluster. Note: the
     **latest version** of the image will be **automatically obtained**
     unless the `refresh` variables is set fo `false`.
@@ -31,15 +31,12 @@ The project comes with two cloud-init files: one for the admin node, the other
 for the generic nodes.
 
 Note well: the system is going to have a `root` and a `qa` users with password
-`linux` (specified on the Terraform variable `passwprd`).
+`linux` (specified on the Terraform variable `password`).
 
 # Cluster architecture
 
 The cluster is made by 1 admin node and the number of generic nodes chosen by
 the user.
-
-All the nodes are based on the same CaaSP image and will have the same amount of
-memory.
 
 All of them have a cloud-init ISO attached to them to inject the cloud-init
 configuration.
@@ -49,23 +46,49 @@ that satisfies CaaSP's basic network requirement: there's a DHCP and a DNS
 enabled but the DNS server is not able to resolve the names of the nodes inside
 of that network.
 
-# Creating the cluster
+# Usage
 
-Steps to perform:
+These are some examples of what you can do with the `caasp` script:
 
-  * Configure the cluster the way you want (see above section).
-  * Execute: `terraform apply`
+* Create a cluster in the tupperware environment, with the
+"fix_deployment" branch of Salt, orchestrating and then creating
+a snapshot of the VMs
 
-At the end of the deployment you will see the IP address of the admin server.
-Use the velum instance running inside of this node to deploy the CaaSP cluster.
+```
+./caasp --env tupperware \
+        --salt-src-branch fix_deployment \
+        'cluster create ; salt wait ; orch boot ; cluster snapshot'
+```
 
-## Using specific cluster profiles
+* Run the `tests/orchestration-simple.scene` script, but after the
+`post-create` stage
 
-There are some specific profiles that can be useful for adding some extra
-behaviour for developers, QA people, etc.
-Take a look at these profiles (and read the instructions on how to use them):
+```
+./caasp --script tests/orchestration-simple.scene \
+        --script-begin post-create
+```
 
-* the [development](profiles/devel) profile
+* Dump the `/etc/hosts` in any machine that matches `node-1`
 
-These files could be used as templates for your own `terraform-local.tf` recipes...
+```
+./caasp @node-1 cat /etc/hosts
+```
 
+## First steps
+
+* Run `./caasp cluster create` for creating the VMs in the _localhost_.
+* Then run the bootstrap orchestration with `./caasp orch boot`.
+* Finally, you can get a valid kubeconfig file with `./caasp orch kubeconfig`
+
+You can also ssh to any machine with `./caasp ssh <name>`.
+
+## Development mode
+
+You can enable the _development mode_ by running `./caasp devel enable`. This will:
+
+  * link the `terraform/profile-devel.tf` file into the top directory, adding features
+  like copying Salt code, assigning roles, etc. Checkout the contents of this Terraform
+  file. If it does not suit your needs, you can create your own development profile
+  and use it with `./caasp --tf-devel-profile=<MY_PROFILE> devel enable`.
+  * prior to any orchestration, it will sync the local Salt code directory with the
+  directory in the Admin Node.

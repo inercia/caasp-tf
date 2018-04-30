@@ -1,1607 +1,2382 @@
-#!/bin/sh
-#
-# Author(s): Alvaro Saurin <alvaro.saurin@suse.com>
-#
-# Copyright (c) 2017 SUSE LINUX GmbH, Nuernberg, Germany.
-#
-# All modifications and additions to the file contributed by third parties
-# remain the property of their copyright owners, unless otherwise agreed
-# upon. The license for this file, and modifications and additions to the
-# file, is the same license as for the pristine package itself (unless the
-# license for the pristine package is not an Open Source License, in which
-# case the license is the MIT License). An "Open Source License" is a
-# license that conforms to the Open Source Definition (Version 1.9)
-# published by the Open Source Initiative.
-#
+#!/usr/bin/env python
 
-[ -n "$DEBUG" ] && set -x
+import argparse
+import glob as gb
+import json
+import logging
+import os
+import os.path as op
+import random
+import re
+import readline
+import socket
+import subprocess
+import sys
+import time
+import traceback
+from cmd import Cmd
+from datetime import datetime, timedelta
 
-CAASPCTL="${BASH_SOURCE[0]}"
-DIR="$( cd "$( dirname "$CAASPCTL" )" && pwd )"
+import yaml
 
-# directory where the CA certificate is stored
-CERT_CA_DIR="/etc/pki"
+# logging format
+# https://docs.python.org/2/library/logging.html#logrecord-attributes
+FORMAT = '# %(asctime)s [%(levelname)s] %(message)s'
 
-# where admin certificates will be generated to
-CERT_ADMIN_DIR="/root/certs"
+# the version for this
+VERSION = "0.1"
 
-# the name is important, but the IP not so much (as we will
-# use /etc/hosts). This is required since GOLANG does not like
-# self-signed certs without IP SANs.
-REGISTRY_HOSTNAME=${REGISTRY_HOSTNAME:-"dashboard"}
-REGISTRY_PORT=5000
-REGISTRY_IP=${REGISTRY_IP:-}
-REGISTRY="$REGISTRY_HOSTNAME:$REGISTRY_PORT"
-
-# where certificates will be generated to / read from
-REGISTRY_CERTS_DIR="$DIR/certificates.local"
-
-# some Salt options
-SALT_OPTS=${SALT_OPTS:-"--force-color"}
-
-# default orchestration options
-ORCH_OPTS=${ORCH_OPTS:-"-l debug --force-color"}
-ORCH_DEFAULT="kubernetes"
-ORCH_REMOVAL="removal"
-ORCH_ADDITION="addition"
-ORCH_LOG="/tmp/orch.log"
+# some orchestrations and arguments
+ORCH_DEFAULT = 'kubernetes'
+ORCH_REMOVAL = 'removal'
+ORCH_ADDITION = 'addition'
+ORCH_OPTS = "-l debug --force-color --hard-crash"
 
 # some key container (partial) names
-CONTAINER_REGISTRY="registry"
-CONTAINER_REGISTRY_TAG="2"
-CONTAINER_SALT_MASTER="salt-master"
-CONTAINER_SALT_API="salt-api"
-CONTAINER_VELUM="velum-dashboard"
-CONTAINER_MARIADB="velum-mariadb"
+CONTAINER_REGISTRY = "registry"
+CONTAINER_REGISTRY_TAG = "2"
+CONTAINER_SALT_MASTER = "salt-master"
+CONTAINER_SALT_API = "salt-api"
+CONTAINER_VELUM = "velum-dashboard"
+CONTAINER_MARIADB = "velum-mariadb"
+CONTAINER_OPENLDAP = "openldap"
 
-CONTAINER_START_TIMEOUT=300
+CONTAINER_START_TIMEOUT = 300
+
+# directory where the CA certificate is stored
+CERT_CA_DIR = "/etc/pki"
+
+# where admin certificates will be generated to
+CERT_ADMIN_DIR = "/root/certs"
+
+UPDATE_GRAIN = "tx_update_reboot_needed"
 
 # the database we use
-VELUM_DB="velum_production"
+DB_NAME = "velum_production"
 
-# the file where the Salt master hostname/IP is configured
-SALT_MASTER_CONFIG_FILE=/etc/salt/minion.d/master.conf
+# password file in the database container
+DB_PASSWORD_FILE = '/var/lib/misc/infra-secrets/mariadb-root-password'
 
-# default URL for the API server
-API_SERVER_URL="https://api.infra.caasp.local:6443"
-
-# the Rail executable
-RAILS_EXE="/srv/velum/vendor/bundle/ruby/2.1.0/bin/rails"
+# command for inserting in the database, querying, etc...
+DB_INSERT_CMD = 'INSERT INTO pillars (pillar, value) VALUES (\'{key}\', \'{value}\');'
+DB_QUERY_PILLAR_CMD = 'SELECT * FROM pillars;'
+DB_FLUSH_PILLAR_CMD = 'TRUNCATE TABLE pillars;'
+DB_QUERY_MINIONS_CMD = 'SELECT * FROM minions;'
+DB_QUERY_EVENTS = 'SELECT data FROM salt_events ORDER BY alter_time;'
 
 # vendors accepted by zypper
-ZYPPER_VENDORS="suse,opensuse,obs://build.suse.de,obs://build.opensuse.org"
+ZYPPER_VENDORS = "suse,opensuse,obs://build.suse.de,obs://build.opensuse.org"
+ZYPPER_IN_ARGS = '--force-resolution --no-recommends'
 
-# the admin user in kubernetes
-K8S_ADMIN_USER="cluster-admin"
+# commands for running the activation script
+SCRIPT_ACTIVATION = '''
+  systemctl stop kubelet
+  sleep 2
 
-# grain used for marking that the node needs to be updated
-UPDATE_GRAIN="tx_update_reboot_needed"
+  docker ps -q | xargs -r docker stop
+  docker ps -q | xargs -r docker kill
+  sleep 2
 
-# files with key-value assignements for the pillar (order is important)
-PILLARS_FILES="$(dirname $CAASPCTL)/pillar.lst \
-  $(dirname $CAASPCTL)/pillar-local.lst \
-  $(dirname $CAASPCTL)/pillar.local.lst"
+  chmod 755 `find /usr/share/caasp-container-manifests -name "*.sh"`
 
-PYTHON_EVENTS_PROC=$CAASPCTL-events-proc
+  /usr/share/caasp-container-manifests/activate.sh
+
+  systemctl start kubelet
+  systemctl start salt-minion
+'''
+
+# commands for generating a valid kubeconfig
+SCRIPT_KUBECONFIG = '''
+  openssl genrsa -out {cert_admin_dir}/admin.key 2048
+  openssl req -new -key {cert_admin_dir}/admin.key -out {cert_admin_dir}/admin.csr -subj "/CN={cert_admin_user}/O=system:masters"
+  openssl x509 -req -in {cert_admin_dir}/admin.csr -CA {ca_crt} -CAkey {ca_key} -CAcreateserial -out {cert_admin_dir}/admin.crt -days 365
+  rm -f {cert_admin_dir}/admin.csr
+
+  kubectl config set-cluster default-cluster --embed-certs=true --server="{apiserver}" --certificate-authority="{ca_crt}"
+  kubectl config set-credentials "{cert_admin_user}" --embed-certs=true --certificate-authority="{ca_crt}" --client-key="{cert_admin_dir}/admin.key" --client-certificate="{cert_admin_dir}/admin.crt"
+  kubectl config set-context default-system --cluster=default-cluster --user="{cert_admin_user}"
+  kubectl config use-context default-system
+'''
+
+# command for remouonting the filesystem in read-write mode
+SCRIP_REMOUNT_RW = '''
+btrfs property set -ts /.snapshots/1/snapshot ro false
+mount -o remount,rw /
+'''
+
+# the admin user in kubernetes (used for generating certificates/kubeconfig)
+K8S_ADMIN_USER = "cluster-admin"
+
+# RC files that are automatically loaded on startup
+# can be used for doing some actions or setting default values
+CAASPCTL_RC_FILES = [
+    '.caaspctl.rc',
+    '.caaspctlrc',
+    'caaspctl.rc',
+    'caaspctlrc',
+    '~/.caaspctl.rc',
+    '~/.caaspctlrc',
+    '~/caaspctl.rc',
+    '~/caaspctlrc'
+]
+
+COLORS = {
+    'HEADER': '\033[95m',
+    'BLUE': '\033[94m',
+    'GREEN': '\033[92m',
+    'RED': '\033[91m',
+    'ENDC': '\033[0m',
+    'BOLD': '\033[1m',
+    'UNDERLINE': '\033[4m'
+}
+
+PROMPT_COLORS = ['UNDERLINE', 'BLUE']
+
+# fields exported in CSV files
+CSV_FIELDS = ['orch', 'jid', 'node', 'start', 'end', 'stage', 'name', 'result']
 
 ####################################################################
+# Command line arguments
+####################################################################
 
-log()        { echo ">>> $1" ; }
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    description='A utility for managing CaaSP',
+    epilog="")
 
-# usage: repeated_char "*" 20
-repeated_char() {
- str=$1
- num=$2
- v=$(printf "%-${num}s" "$str")
- log "${v// /*}"
-}
+parser.add_argument('args',
+                    nargs=argparse.REMAINDER,
+                    help='commands to run (get more info with "help")')
 
-print_hr()   { repeated_char "*" 80 ; }
+verbose_group = parser.add_argument_group(
+    title='Logging/verbosity')
 
-log_sys()    { log "$1" ; logger -t "caaspctl" "$1" ; }
-log_sys_hr() { print_hr ; log_sys "$1" ; print_hr ; }
-warn()       { log "WARNING: $1" ; }
-abort()      { log "FATAL: $1" ; exit 1 ; }
+verbose_group.add_argument('--debug',
+                           dest='debug',
+                           default=False,
+                           action='store_true',
+                           help='use debug logging')
 
-# join all the [1:] arguments by the first one
-join_by()    { local IFS="$1"; shift; echo "$*"; }
+script_group = parser.add_argument_group(
+    title='Loadding commands from scripts')
 
-# return a JSON list from the list of arguments
-as_json_lst() { python -c "import json, sys ; print json.dumps(sys.argv[1:])" $@ | tr -d ' ' ; }
+script_group.add_argument('--script',
+                          dest='script',
+                          metavar='FILE',
+                          default='',
+                          help='read a list of commands from a script')
+script_group.add_argument('--script-only',
+                          dest='script_only',
+                          default=True,
+                          action='store_true',
+                          help='quit after running the script')
+script_group.add_argument('--script-begin',
+                          dest='script_begin',
+                          metavar='STAGE',
+                          default='',
+                          help='process the script after stage <STAGE>')
 
-get_regular_container() {
-  docker ps | grep "$1" | awk '{print $1}'
-}
+database_group = parser.add_argument_group(
+    title='Misc')
 
-get_container() {
-  get_regular_container "k8s_$1_velum"
-}
+database_group.add_argument('--database',
+                            dest='database',
+                            metavar='DB',
+                            default=DB_NAME,
+                            help='database to use')
 
-get_cid() {
-  name=$1
-  case "$name" in
-    salt-master|salt)
-      get_container "$CONTAINER_SALT_MASTER"
-      ;;
-    velum)
-      get_container "$CONTAINER_VELUM"
-      ;;
-    mariadb|mysql|maria|db)
-      get_container "$CONTAINER_MARIADB"
-      ;;
-    api|salt-api|API)
-      get_container "$CONTAINER_SALT_API"
-      ;;
-    *)
-      get_container "$name"
-      ;;
-  esac
-}
+certs_group = parser.add_argument_group(
+    title='Certificates')
 
-wait_for_container() {
-  local count=0
-  until [ -n "`get_cid $1`" ] ; do
-    left=$((CONTAINER_START_TIMEOUT - count))
-    log "Waiting for container $1 ($left secs left)..."
-    sleep 1
-    [ "$count" -gt "$CONTAINER_START_TIMEOUT" ] && abort "timeout waiting for container $1"
-    count=$((count+1))
-  done
-}
+certs_group.add_argument('--cert-ca-dir',
+                         dest='cert_ca_dir',
+                         metavar='DIR',
+                         default=CERT_CA_DIR,
+                         help='directory where the CA certificate is stored')
+certs_group.add_argument('--cert-admin-dir',
+                         dest='cert_admin_dir',
+                         metavar='DIR',
+                         default=CERT_ADMIN_DIR,
+                         help='where admin certificates will be generated to')
+certs_group.add_argument('--cert-admin_user',
+                         dest='cert_admin_user',
+                         metavar='USER',
+                         default=K8S_ADMIN_USER,
+                         help='the admin user in kubernetes')
 
-exec_in_container() {
-  # do not expand globs
-  set -f
 
-  local c=$(get_cid $1)
-  [ -n "$c" ] || abort "exec_in_container: could not get $1 container... are you sure it is running here?"
-  shift
-  docker exec "$c" "$@"
-}
+events_group = parser.add_argument_group(
+    title='Events')
 
-restart_container() {
-  c=$(get_cid $1)
-  [ -n "$c" ] || abort "could not get the container $1... are you sure it is running here?"
-  log_sys "Restarting $1 container..."
-  docker restart $c
-}
+events_group.add_argument('--outfile-csv-sep',
+                          dest='outfile_csv_sep',
+                          nargs='?',
+                          default=',',
+                          help='CSV separator')
+events_group.add_argument('--plotly-user',
+                          nargs='?',
+                          help='plotly user name')
+events_group.add_argument('--plotly-token',
+                          nargs='?',
+                          help='plotly token')
 
-wait_for_db() {
-  local db=$1
-  local count=0
-  until exec_in_container "$MARIADB_CONTAINER" \
-    bash -c 'mysql -uroot -p`cat $MARIADB_PASS_PATH` -e "show databases"' | \
-    grep "$db" &>/dev/null ; do
-    log "(waiting for database $db...)"
-    sleep 5
-    [ "$count" -gt "$CONTAINER_START_TIMEOUT" ] && abort "timeout waiting for database $db"
-    count=$((count+5))
-  done
-  sleep 20
-  log "Database seems to be present"
-}
+commands_group = parser.add_argument_group(
+    title='Commands processing',
+    description='How commands are processed from command line or from the loop')
 
-# interface with the default route
-default_iface() {
-  /sbin/ip route | awk '/default/ { print $5 }'
-}
+commands_group.add_argument('--loop',
+                            dest='loop',
+                            default=False,
+                            action='store_true',
+                            help='the loop is only started when no commands are provided in command line. With this flag, the loop is started even when commands are provided as arguments')
+commands_group.add_argument('--commands-pre',
+                            dest='commands_pre',
+                            default=False,
+                            action='store_true',
+                            help='process commands from arguments BEFORE processing scripts')
+commands_group.add_argument('--exit-on-error',
+                            dest='exit_on_err',
+                            default=False,
+                            action='store_true',
+                            help='exit on any errors instead of just printing the error message')
+commands_group.add_argument('--skip-rc-files',
+                            dest='skip_rc_files',
+                            default=False,
+                            action='store_true',
+                            help='do not load automatically the RC files')
 
-# IP for an interface
-iface_ip() {
-  ifconfig $1 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}'
-}
+args = parser.parse_args()
 
-default_iface_ip() {
-  iface_ip `default_iface`
-}
 
-do_reboot() {
-  log "Rebooting $(hostname) - $(cat /etc/machine-id)..."
-  rebootmgrctl reboot
-}
+loglevel = (logging.DEBUG if args.debug else logging.INFO)
+log = logging.getLogger(__name__)
+logging.basicConfig(stream=sys.stderr,
+                    format=FORMAT,
+                    level=loglevel)
 
-# get the IP address of a (random) master
-get_master_ip() {
-  $CAASPCTL salt \
-    --no-color --log-level critical --out=newline_values_only \
-    -C 'G@roles:kube-master' \
-    network.interface_ip eth0 2>/dev/null | \
-    head -n1
-}
+try:
+    import coloredlogs
+
+    # By default the install() function installs a handler on the root logger,
+    # this means that log messages from your code and log messages from the
+    # libraries that you use will all show up on the terminal.
+    coloredlogs.install(fmt=FORMAT, level=loglevel)
+except ImportError:
+    log.debug('"coloredlogs" not available')
+
+readline.set_completer_delims(' \t\n')
+
+####################################################################
+# Aux
+####################################################################
+
+
+def get_assign_from_str(line):
+    res = {}
+
+    if len(line) == 0:
+        return res
+
+    try:
+        assert(isinstance(line, str))
+        for assign in line.split(','):
+            var = assign.split('=')
+            variable = var[0].lstrip()
+            value = var[1].lstrip()
+            value = value_to_native(value)
+
+            res[variable] = value
+    except IndexError as e:
+        log.debug('could not parse assignments in "%s": %s', line, e)
+
+    return res
+
+
+def execute(cmd, sudo=False, password=None):
+    ''' Execute a command '''
+    assert(isinstance(cmd, str))
+
+    for line in cmd.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        if sudo:
+            if password:
+                cmd = "echo %s | sudo -S %s" % (password, line)
+            else:
+                cmd = "sudo -S %s" % (line)
+        else:
+            cmd = line
+
+        log.debug('Running "%s"', cmd)
+        popen = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, universal_newlines=True)
+        for stdout_line in iter(popen.stdout.readline, ""):
+            yield stdout_line
+
+        popen.stdout.close()
+        return_code = popen.wait()
+        if return_code:
+            raise subprocess.CalledProcessError(return_code, cmd)
+
+
+def execute_interactive(cmd, sudo=False, password=None):
+    ''' Execute an interactive command, returning the `retcode` '''
+    assert(isinstance(cmd, str))
+
+    if sudo:
+        cmd = "echo %s | sudo -S %s" % (password, cmd)
+
+    log.debug('Starting interactive command "%s"', cmd)
+    return subprocess.call(cmd, shell=True)
+
+
+def execute_now(cmd, strip_nls=True):
+    res = []
+    for line in cmd.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        out = str(subprocess.check_output(line, shell=True))
+        if strip_nls:
+            out = out.strip('\n')
+
+        res.append(out)
+
+    if strip_nls:
+        return ' '.join(res)
+    else:
+        return '\n'.join(res)
+
+
+#########################
+# Network
+#########################
+
+def is_ip(name):
+    try:
+        socket.inet_aton(name)
+        return True
+    except socket.error:
+        return False
+
+
+def default_iface_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # doesn't even have to be reachable
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
+
+#########################
+# Containers
+#########################
+
+
+class ContainerNotFoundException(Exception):
+    pass
+
+
+class ContainerWaitTimeout(Exception):
+    pass
+
+
+def get_regular_container(name):
+    docker_ps_out = execute_now('docker ps')
+    for line in docker_ps_out.split('\n'):
+        fields = re.split('\s{2,}', line.strip())
+        cid = fields[0]
+        cname = fields[5]
+        if name in cname:
+            return cid
+
+    return None
+
+
+def get_container(name):
+    return get_regular_container("k8s_{name}_velum".format(name=name))
+
+
+def get_cid(name):
+    if name in ['salt-master', 'salt']:
+        return get_container(CONTAINER_SALT_MASTER)
+    elif name in ['velum']:
+        return get_container(CONTAINER_VELUM)
+    elif name in ['mariadb', 'mysql', 'maria', 'db']:
+        return get_container(CONTAINER_MARIADB)
+    elif name in ['api', 'salt-api', 'API']:
+        return get_container(CONTAINER_SALT_API)
+    elif name in ['ldap', 'openldap']:
+        return get_container(CONTAINER_OPENLDAP)
+    else:
+        return get_container(name)
+
+
+def enter_container(name):
+    cid = get_cid(name)
+    return execute_interactive('docker exec -ti {} /bin/sh'.format(cid))
+
+
+def attach_container(name):
+    cid = get_cid(name)
+    return execute_interactive('docker attach {}'.format(cid))
+
+
+def get_container_logs(name):
+    try:
+        c = get_cid(name)
+    except Exception as e:
+        log.debug('could not find container %s: %s', name, e)
+        raise ContainerNotFoundException('could not find container {name}'.format(name=name))
+
+    cmd = 'docker logs {}'.format(c)
+    for line in execute(cmd):
+        if line:
+            yield line
+
+
+def wait_for_container(name, timeout=CONTAINER_START_TIMEOUT):
+    '''Wait for a container to be up and running'''
+    timeout_limit = datetime.now() + timedelta(seconds=timeout)
+    while datetime.now() <= timeout_limit:
+        try:
+            cid = get_cid(name)
+            if cid:
+                log.debug('container %s is running with ID %s', name, cid)
+                return
+        except:
+            pass
+
+        log.debug("Waiting for container {} ({} left)...".format(
+            name, timeout_limit - datetime.now()))
+        time.sleep(5)
+
+    raise ContainerWaitTimeout('timeout while waiting for {}'.format(name))
+
+
+def exec_in_container(name, cmd, wait=False):
+    if wait:
+        wait_for_container(name)
+
+    try:
+        c = get_cid(name)
+    except Exception as e:
+        log.debug('could not find container %s: %s', name, e)
+        c = None
+
+    if not c:
+        raise ContainerNotFoundException('could not find container {name}'.format(name=name))
+
+    cmd = 'docker exec {} {}'.format(c, cmd)
+    log.debug('Executing in container %s command "%s"', c, cmd)
+    for line in execute(cmd):
+        if line:
+            yield line
+
+
+def restart_container(name):
+    '''Restart a container'''
+    try:
+        c = get_cid(name)
+    except Exception as e:
+        log.debug('could not find container %s: %s', name, e)
+        raise ContainerNotFoundException('could not find container {name}'.format(**locals()))
+
+    log.info('Restarting container %s', name)
+    cmd = 'docker restart {c}'.format(**locals())
+    return execute_now(cmd)
+
+
+#########################
+# database
+#########################
+
+
+def get_db_password(filename=DB_PASSWORD_FILE):
+    cmd = 'cat ' + filename
+    for line in exec_in_container('db', cmd, wait=True):
+        return line.strip()  # return only the first line
+
+
+def exec_sql_in_db(cmd, **kwargs):
+    password = get_db_password()
+    log.debug('Using password %s', password)
+    cmd = 'mysql -uroot -p\'{password}\' -B -t -e "{cmd}" {db}'.format(
+        cmd=cmd, db=args.database, password=password)
+    for line in exec_in_container('db', cmd, **kwargs):
+        yield line
+
+
+def wait_for_db(db=None, timeout=CONTAINER_START_TIMEOUT):
+    ''' Wait for the database to be ready '''
+    db = db or args.database
+    password = get_db_password()
+    log.debug('using password %s', password)
+
+    timeout_limit = datetime.now() + timedelta(seconds=timeout)
+    while datetime.now() <= timeout_limit:
+        try:
+            for line in exec_sql_in_db('SHOW DATABASES;'):
+                if db in line:
+                    log.debug('Database "%s" seems to be ready', db)
+                    return
+        except:
+            pass
+
+        log.info("Waiting for database {} ({} left)...".format(db, timeout_limit - datetime.now()))
+        time.sleep(5)
+
+    raise ContainerWaitTimeout('timeout while waiting for database {}'.format(db))
+
+
+def pillar_db_insert(key, value, **kwargs):
+    log.info('Adding pillar "%s"="%s"', key, value)
+    cmd = DB_INSERT_CMD.format(**locals())
+    for line in exec_sql_in_db(cmd, **kwargs):
+        yield line
+
+#########################
+# /etc/hosts management
+#########################
+
+
+def etchosts_contains(name):
+    with open('/etc/hosts', 'r') as f:
+        for line in f.readlines():
+            line = line.strip()
+            if line.startswith('#'):
+                continue
+
+            line_comps = re.split('\s{1,}', line)
+            for component in line_comps:
+                if name.strip() == component.strip():
+                    return True
+    return False
+
+
+def etchosts_add(name, ip):
+    if not name:
+        raise CommandError("no name provided")
+    if not ip:
+        raise CommandError("no IP provided")
+
+    log.info("Adding %s", name)
+    hosts_line = "{ip} {name}".format(**locals())
+
+    if etchosts_contains(name):
+        log.info("%s already exists", name)
+    else:
+        log.debug("Adding a new %s=%s entry to your /etc/hosts", name, ip)
+        with open('/etc/hosts', 'a') as file:
+            file.write(hosts_line + '\n')
+
+
+def etchosts_del(name):
+    if not name:
+        raise CommandError("no name provided")
+
+    log.info("Removing %s (if present)", name)
+    if etchosts_contains(name):
+        log.debug("%s found: removing...", name)
+        cmd = 'sed -i".bak" "/{name}/d" /etc/hosts'.format(name=name)
+        execute_now(cmd)
+
+#########################
+# Salt
+#########################
+
+
+def get_salt_where_from(name):
+    try:
+        return {
+            "ca": "G@roles:ca",
+            "admin": "G@roles:admin",
+            "master": "G@roles:kube-master",
+            "masters": "G@roles:kube-master",
+            "minion": "G@roles:kube-minion",
+            "minions": "G@roles:kube-minion",
+            "nodes": "P@roles:kube-(master|minion)",
+            "workers": "P@roles:kube-(master|minion)"
+        }[name.lower()]
+    except KeyError:
+        return name
+
+
+def exec_in_salt(cmd,
+                 compound=None,
+                 color=False,
+                 newlines=True,
+                 ignore_stderr=True,
+                 out=None,
+                 salt_args='',
+                 debug=False,
+                 **kwargs):
+
+    debug_level = 'critical' if not debug else 'debug'
+    color_arg = '--force-color' if color else '--no-color'
+    compound_arg = " -C '{}'".format(compound) if compound else ''
+
+    cmd_args = '{compound_arg} --log-level={debug_level} {salt_args} '.format(**locals())
+
+    if out:
+        cmd_args += " --out={}".format(out)
+    elif newlines:
+        cmd_args += ' --out=newline_values_only '
+
+    # TODO: add other matchers
+
+    cmd = '/usr/bin/salt {cmd_args} {cmd}'.format(**locals())
+    if ignore_stderr:
+        cmd = cmd + ' 2>/dev/null'
+
+    for line in exec_in_container('salt', cmd, **kwargs):
+        if line:
+            yield line
+
+
+def exec_salt_runner(cmd, **kwargs):
+    opts = kwargs.pop('salt_args', ORCH_OPTS)
+    cmd = '/usr/bin/salt-run {} --force-color {}'.format(opts, cmd)
+    for line in exec_in_container('salt-master', cmd, **kwargs):
+        yield line
+
+
+def exec_salt_key(cmd, **kwargs):
+    cmd = '/usr/bin/salt-key --force-color ' + cmd
+    for line in exec_in_container('salt-master', cmd, **kwargs):
+        yield line
+
+
+def get_salt_keys(status='all'):
+    for line in exec_salt_key('-l ' + status, wait=True):
+        yield line
+
+
+def get_salt_keys_accepted():
+    for line in get_salt_keys(status='acc'):
+        yield line
+
+
+def get_salt_keys_rejected():
+    for line in get_salt_keys(status='rej'):
+        yield line
+
+
+def get_salt_keys_accepted_num():
+    out = list(exec_salt_key('-l acc', wait=True))
+    return len(out[1:])
+
+
+def wait_for_num_keys_accepted(num_keys, timeout=CONTAINER_START_TIMEOUT):
+    log.info("Waiting for %d Salt keys to be accepted...", num_keys)
+    wait_for_container('salt')
+
+    timeout_limit = datetime.now() + timedelta(seconds=timeout)
+    while datetime.now() <= timeout_limit:
+        # accept all the pending keys
+        # this will fail if no keys have been submitted yet
+        try:
+            for line in exec_salt_key('--accept-all --yes'):
+                yield line
+        except:
+            pass
+
+        num_accepted = get_salt_keys_accepted_num()
+        if num_accepted >= num_keys:
+            return
+
+        log.info("Waiting for %d Salt keys to be accepted: %d accepted (%s secs left)...",
+                 num_keys, num_accepted, str(timeout_limit - datetime.now()))
+        time.sleep(5)
+
+    raise ContainerWaitTimeout('timeout waiting for {} to be accepted'.format(num_keys))
+
+
+SALT_AVAIL_SYNC = ['all', 'engines', 'grains', 'beacons', 'utils', 'returners',
+                   'modules', 'renderers', 'log_handlers', 'states', 'sdb', 'proxymodules', 'output']
+
+
+def salt_sync(what='all'):
+    what = what.strip().lower()
+    if what not in SALT_AVAIL_SYNC:
+        raise CommandError('unknown sync target "{}"'.format(what))
+
+    log.info('Synchronizing %s', what)
+    cmd = 'saltutil.sync_{} refresh=True'.format(what)
+    for line in exec_in_salt(cmd, compound='*', wait=True):
+        yield line
+
+
+def grain_set(where, key, value):
+    log.info("Setting grain %s=%s in %s", key, value, where)
+    where = get_salt_where_from(where)
+    cmd = 'grains.set "{}" "{}"'.format(key, value)
+    for line in exec_in_salt(cmd, compound=where, wait=True):
+        yield line
+
+
+def grain_ls(where):
+    log.info("Listing grains (in '%s')", where)
+    where = get_salt_where_from(where)
+    cmd = 'grains.ls'
+    for line in exec_in_salt(cmd, compound=where, wait=True):
+        yield line
+
+
+def grain_items(where):
+    log.info("Listing grains (in '%s')", where)
+    where = get_salt_where_from(where)
+    cmd = 'grains.items'
+    for line in exec_in_salt(cmd, compound=where, wait=True):
+        yield line
+
+#########################
+# aux
+#########################
+
+
+def do_reboot():
+    log.info('Rebooting machine')
+    for line in execute('rebootmgrctl reboot'):
+        yield line
+
+
+# get ONE OF the masters' IP address
+def get_master_ip():
+    for line in exec_in_salt('network.interface_ip eth0',
+                             compound='G@roles:kube-master',
+                             color=False, wait=True):
+        res = line.strip()  # return only the first line
+        return str(res) if is_ip(res) else None
+
 
 # get the name of a (random) master
-get_master_name() {
-  $CAASPCTL salt --no-color \
-    -C 'G@roles:kube-master' \
-    grains.get caasp_fqdn --out=text 2>/dev/null | \
-    head -n1 | cut -f2 -d" "
-}
 
-get_salt_where_from() {
-  case $1 in
-    "master"|"masters")
-      echo "G@roles:kube-master"
-      ;;
-    "minion"|"minions")
-      echo "G@roles:kube-minion"
-      ;;
-    "nodes"|"workers")
-      echo "P@roles:kube-(master|minion)"
-      ;;
-    *)
-      echo "$1"
-  esac
-}
+
+def get_master_name():
+    for line in exec_in_salt('network.interface_ip eth0',
+                             compound='G@roles:kube-master',
+                             color=False, wait=True):
+        res = line.split(' ')[2]  # return only the first line
+        return str(res) if is_ip(res) else None
+
+#########################
+# Output/conversions
+#########################
+
+
+def str2bool(v):
+    return v.lower() in ("yes", "true", "t", "1")
+
+
+def replace_pattern(pat, replacer, line):
+    for t in re.finditer(pat, line):
+        txt = str(t.group())
+        out = replacer(txt)
+        line = line.replace(txt, out)
+    return line
+
+
+def value_to_native(val):
+    if isinstance(val, str):
+        try:
+            return int(val)
+        except ValueError:
+            pass
+
+        if val.lower() in ["true", "yes", "on"]:
+            return True
+        elif val.lower() in ["false", "no", "off"]:
+            return False
+
+        val = os.path.expandvars(val)
+
+        # in case it is a quoted string, remove them
+        if val[0] in ['\'', '"']:
+            return val[1:-1]
+
+    return val
+
+
+def parse_json_from_iter(it):
+    for line in it:
+        line = line.replace("\\", r"\\")
+        for t in re.finditer(r"\{.*\}", line):
+            try:
+                json_line = t.group()
+                json_line = json_line.replace('\\"', r'"')
+                json_line = json_line.replace('//', r'')
+                yield json.loads(json_line)
+            except ValueError as e:
+                log.error('JSON decoding error: %s on %s', e, json_line[:80])
+
+
+def expandvars(path):
+    return re.sub(r'(?<!\\)\$[A-Za-z_][A-Za-z0-9_]*', '', os.path.expandvars(path))
+
+
+def on_color(color, txt):
+    res = ''
+    if isinstance(color, list):
+        res += ''.join([COLORS[x] for x in color])
+    else:
+        res += COLORS[color]
+
+    return res + txt + COLORS['ENDC']
+
+
+def prompt(txt):
+    return on_color(PROMPT_COLORS, '{} >'.format(txt)) + ' '
+
+
+def print_iterator(it, **kwargs):
+    for line in it:
+        sys.stdout.write(line)
+
+
+def complete_path(path):
+    if op.isdir(path):
+        return gb.glob(op.join(path, '*'))
+    else:
+        return gb.glob(path + '*')
+
+
+#########################
+# load/save events
+#########################
+
+def save_orch_plot(orch_lines):
+    if orch_lines:
+        import plotly.plotly as py
+        import plotly.figure_factory as ff
+
+        if args.plotly_user:
+            py.sign_in(args.plotly_user, args.plotly_token)
+
+        def randcolor():
+            return random.randrange(0, 256)
+
+        # detect all the possible orch stages, and assign to each one a color
+        colors = {}
+        for orch_line in orch_lines:
+            if orch_line['name'] not in colors:
+                colors[orch_line['name']] = 'rgb({},{},{})'.format(
+                    randcolor(), randcolor(), randcolor())
+
+        actions = []
+        for orch_line in orch_lines:
+            action_item = {'Task': orch_line['node'],
+                           'Node': orch_line['name'],
+                           'Start': orch_line['start'],
+                           'Finish': orch_line['end'],
+                           'Resource': orch_line['result']}
+            actions.append(action_item)
+
+        fig = ff.create_gantt(actions,
+                              colors=colors,
+                              index_col='Node',
+                              title='Orchestration',
+                              group_tasks=True)
+        py.plot(fig,
+                filename=args.outfile_plot,
+                world_readable=True)
+
+
+def save_orch_csv(orch_lines):
+    if orch_lines:
+        import csv
+        writer = csv.DictWriter(sys.stdout,
+                                delimiter=args.outfile_csv_sep,
+                                fieldnames=CSV_FIELDS)
+
+        writer.writeheader()
+        for line in orch_lines:
+            writer.writerow(line)
+
 
 ########################
 # registry
 ########################
 
-TMP_REGISTRY_CNF=/tmp/registry-openssl.cnf
-
-CA_CRT="$REGISTRY_CERTS_DIR/ca.pem"
-CA_KEY="$REGISTRY_CERTS_DIR/ca-key.pem"
-CA_CSR="$REGISTRY_CERTS_DIR/ca.csr"
-
-REG_CRT="$REGISTRY_CERTS_DIR/registry.pem"
-REG_KEY="$REGISTRY_CERTS_DIR/registry-key.pem"
-REG_CSR="$REGISTRY_CERTS_DIR/registry.csr"
-
-
-reg_gen_certs() {
-  mkdir -p "$REGISTRY_CERTS_DIR"
-  rm -f "$REG_KEY" "$REG_CRT" "$REG_CSR"
-
-  if [ -z "$REGISTRY_IP" ] ; then
-    REGISTRY_IP=$(default_iface_ip)
-    [ -n "$REGISTRY_IP" ] || abort "could not guess default interface IP"
-  fi
-
-  log "Generating openssl config"
-  echo "[req]" >$TMP_REGISTRY_CNF
-  echo "prompt                      = no" >>$TMP_REGISTRY_CNF
-  echo "req_extensions              = v3_req" >>$TMP_REGISTRY_CNF
-  echo "distinguished_name          = req_distinguished_name" >>$TMP_REGISTRY_CNF
-  echo "[ req_distinguished_name ]" >>$TMP_REGISTRY_CNF
-  echo "countryName                 = US" >>$TMP_REGISTRY_CNF
-  echo "stateOrProvinceName         = Somewhere" >>$TMP_REGISTRY_CNF
-  echo "localityName                = Somewhere" >>$TMP_REGISTRY_CNF
-  echo "organizationName            = SUSE" >>$TMP_REGISTRY_CNF
-  echo "commonName                  = $REGISTRY_HOSTNAME" >>$TMP_REGISTRY_CNF
-  echo "[ v3_req ]" >>$TMP_REGISTRY_CNF
-  echo "basicConstraints            = CA:FALSE" >>$TMP_REGISTRY_CNF
-  echo "keyUsage                    = nonRepudiation, digitalSignature, keyEncipherment" >> $TMP_REGISTRY_CNF
-  echo "subjectAltName              = @alt_names" >>$TMP_REGISTRY_CNF
-  echo "[alt_names]" >>$TMP_REGISTRY_CNF
-  echo "DNS.1                       = $REGISTRY_HOSTNAME.local" >>$TMP_REGISTRY_CNF
-  echo "DNS.2                       = $REGISTRY_HOSTNAME" >>$TMP_REGISTRY_CNF
-  echo "IP.1                        = $REGISTRY_IP" >>$TMP_REGISTRY_CNF
-
-  log "Generating CA"
-  openssl genrsa -out "$CA_KEY" 4096
-  openssl req -new -x509 -days 1826 \
-    -key "$CA_KEY" -out "$CA_CRT" \
-    -config "$TMP_REGISTRY_CNF"
-
-  log "Generating registry's private key"
-  openssl genrsa -out "$REG_KEY" 2048
-
-  log "Generating registry's certificate signing request (CSR)"
-  openssl req -new \
-    -key "$REG_KEY" -out "$REG_CSR" \
-    -subj "/CN=$REGISTRY_HOSTNAME" \
-    -config "$TMP_REGISTRY_CNF"
-
-  log "Signing registry's CSR with CA key"
-  openssl x509 -req \
-    -CA "$CA_CRT" -CAkey "$CA_KEY" \
-    -CAcreateserial \
-    -in "$REG_CSR" -out "$REG_CRT" \
-    -days 365 \
-    -extensions v3_req \
-    -extfile "$TMP_REGISTRY_CNF"
-
-  rm -f "$TMP_REGISTRY_CNF"
-
-  log "Dumping certificate information:"
-  openssl x509 -in "$REG_CRT" -text -noout
-  log "Done. Certificates stored at $REGISTRY_CERTS_DIR"
-}
-
-reg_dump_catalog() {
-  log "Dumping registry catalog"
-  CURL_ARGS=
-  if [ -f "$CA_CRT" ] ; then
-    CURL_ARGS="$CURL_ARGS --cacert $CA_CRT"
-    CATALOG_URL="https://$REGISTRY/v2/_catalog"
-  else
-    CATALOG_URL="http://$REGISTRY/v2/_catalog"
-  fi
-  curl $CURL_ARGS "$CATALOG_URL"
-}
-
-reg_start() {
-  [ -f "$REG_KEY" ] || $CAASPCTL certs
-  [ -f "$REG_KEY" ] || abort "no certificate found at $REG_KEY"
-
-  log "Starting the registry"
-  docker run -d -p $REGISTRY_PORT:$REGISTRY_PORT \
-    --restart=always --name registry \
-    -v $REGISTRY_CERTS_DIR:/certs \
-    -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/$(basename "$REG_CRT") \
-    -e REGISTRY_HTTP_TLS_KEY=/certs/$(basename "$REG_KEY") \
-    $CONTAINER_REGISTRY:$CONTAINER_REGISTRY_TAG
-}
-
-reg_import() {
-  local image_name="$1"
-
-  log "Pulling $image_name"
-  docker pull "$image_name"
-
-  local image_hash=$(docker images | grep "$image_name" | grep latest | awk '{ print $3 }')
-
-  log "Tagging $image_hash as $REGISTRY/$image_name"
-  docker tag "$image_hash" "$REGISTRY/$image_name"
-
-  log "Pushing $REGISTRY/$image_name"
-  docker push "$REGISTRY/$image_name"
-
-  $CAASPCTL registry status
-}
-
-reg_usage() {
-  cat<<EOF
-$(basename $CAASPCTL) registry subcommands:
-
-    certs         generate the certificates
-    start         start the registry
-    stop          stop the registry
-    status        dump the registry catalog
-    import IMAGE  import an image to the registry (ie, "caaspctl reg import alpine")
-
-EOF
-}
-
-reg_command() {
-  local command=$1
-  shift
-  case "$command" in
-    certs)
-      reg_gen_certs
-      ;;
-
-    start)
-      reg_start
-      ;;
-
-    stop)
-      log "Stopping the registry"
-      docker stop registry
-      docker rm registry
-      ;;
-
-    status)
-      reg_container=$(get_regular_container $CONTAINER_REGISTRY)
-      [ -n "$reg_container" ] || abort "no registry seems to be running here"
-      reg_dump_catalog
-      ;;
-
-    import)
-      reg_import $@
-      ;;
-
-    help|-h|--help)
-      reg_usage
-      ;;
-
-    * )
-      reg_usage
-      abort "Unknown command $command"
-      ;;
-  esac
-}
-
-########################
-# Salt apply states
-########################
-
-apply_usage() {
-  cat<<EOF
-$(basename $CAASPCTL) apply subcommands:
-
-    at <WHERE> <STATE> [ARGS ...] apply some state on the machines that match <WHERE>
-    at <WHERE> high [ARGS ...]    apply a "highstate" on the machines that match <WHERE>
-    <STATE> [ARGS ...]            apply some state on all the machines in the cluster
-
-where <STATES> is a comma-separated list of states or SLS files
-               (ie, "haproxy,kubeconfig/pre-update.sls")
-      <WHERE>  is a Salt expression like 'G@roles:admin' or an alias
-               like "masters", "minions", etc
-
-Examples:
-
-    * $(basename $CAASPCTL) apply at "G@roles:ca" haproxy
-    * $(basename $CAASPCTL) apply at minions high pillar='{"foo":"bar"}'
-    * $(basename $CAASPCTL) apply etc-hosts
-    * $(basename $CAASPCTL) apply at 'G@caasp_etcd_member' etcd.remove-pre-stop-services
-
-EOF
-}
-
-apply_command() {
-  # do not expand globs
-  set -f
-  local command=$1
-  shift
-  case "$command" in
-    at)
-      local where=$(get_salt_where_from "${1:-admin}")
-      shift
-      local state="${1:-highstate}"
-      shift
-
-      case "$state" in
-        high|HIGH|highstate|HIGHSTATE|hi|HI|h|H)
-          log_sys_hr "Applying highstate on '$where'"
-          exec_salt -C "$where" state.apply $@
-          ;;
-        *)
-          log_sys_hr "Applying '$state' state on '$where'"
-          exec_salt -C "$where" state.apply "$state" $@
-          ;;
-      esac
-      ;;
-    help|-h|--help)
-      apply_usage
-      ;;
-    *)
-      local args="$command $@"
-      [ -n "$args" ] || abort "No command provided"
-      apply_command at '*' $args
-      ;;
-  esac
-}
-
-########################
-# Salt cmd.run
-########################
-
-cmd_usage() {
-  cat<<EOF
-$(basename $CAASPCTL) cmd subcommands:
-
-    at <WHERE> <CMD>   run a command on the machines that match <WHERE>
-                       (ie, '$CAASPCTL cmd at 'G@roles:admin' systemctl restart docker)
-    <CMD>              run some command on all the machines in the cluster
-                       (ie, '$CAASPCTL cmd ls / etc-hosts)
-
-where <WHERE>  is a Salt expression like 'G@roles:admin' or an alias
-               like "masters", "minions", etc
-
-EOF
-}
-
-cmd_command() {
-  # do not expand globs
-  set -f
-  local command=$1
-  shift
-  case "$command" in
-    at)
-      local where=$(get_salt_where_from "${1:-admin}")
-      shift
-      local cmd="$@"
-      [ -n "$cmd" ] || abort "No command provided"
-      log_sys_hr "Running '$cmd' on '$where'"
-      exec_salt -C "$where" cmd.run "$cmd"
-      ;;
-    help|-h|--help)
-      cmd_usage
-      ;;
-    *)
-      local cmd="$command $@"
-      [ -n "$cmd" ] || abort "No command provided"
-      log_sys_hr "Running '$cmd' in all machines"
-      exec_salt -C '*' cmd.run "$cmd"
-      ;;
-  esac
-}
-
-########################
-# Salt pillar
-########################
-
-pillar_usage() {
-  cat<<EOF
-$(basename $CAASPCTL) pillar subcommands:
-
-    set <PILLAR>=<VALUE>   set a PILLAR
-    get <PILLAR> [<WHERE>] get a pillar PILLAR (in WHERE)
-    ls [<WHERE>]           list all the pillars (in WHERE)
-    items [<WHERE>]        get all the pillars and contents (in WHERE)
-
-where <WHERE>  is a Salt expression like 'G@roles:admin' or an alias
-               like "masters", "minions", etc
-               NOTE: default=admin
-EOF
-}
-
-_pillar_db_insert() {
-  [ $# -eq 2 ] || abort "Wrong number of parameters when setting pillar"
-  log_sys "Adding pillar: '$1' = '$2'"
-  exec_in_db "INSERT INTO pillars (pillar, value) VALUES ('$1', '$2');"
-}
-
-_pillar_db_truncate() {
-  log_sys "Truncating pillars database"
-  exec_in_db "TRUNCATE TABLE pillars;"
-}
-
-do_pillar_add() {
-  # old mechanism: do it through the Velum container... slow
-  #wait_for_container velum
-  #exec_in_container velum \
-    #  entrypoint.sh bundle exec rails runner \
-    #    "pillar = Pillar.find_or_initialize_by(pillar: \"$1\"); pillar.value = \"$2\"; pillar.save"
-
-  wait_for_container db
-  _pillar_db_insert $1 $2
-}
-
-# load a file with pillar assignements lines like "<PILLAR> <VALUE>"
-do_pillar_load_file() {
-  local pillar_lst=$1
-
-  wait_for_container db
-  _pillar_db_truncate
-
-  log "Loading $pillar_lst"
-  cat $pillar_lst | \
-    grep -v "^#" | \
-    grep -v "^$" | \
-    while IFS='' read -r line || [ -n "$line" ] ; do
-    local key=$(echo $line | awk '{ print $1 }')
-    local value=$(echo $line | awk '{ print $2 }')
-    if [ -n "$key" ] ; then
-      _pillar_db_insert "$key" "$value"
-    else
-      warning "Empty key in pillars file"
-    fi
-  done
-  log "$pillar_lst loaded"
-  log "NOTE: a 'salt sync' would be needed now..."
-}
-
-pillar_command() {
-  local command=$1
-  shift
-  case "$command" in
-    set)
-      if [ $# -gt 0 ] ; then
-        for x in $@ ; do
-          do_pillar_add "${x%=*}" "${x#*=}"
-        done
-      else
-        warn "No pillar values to set"
-      fi
-      ;;
-    ls|list)
-      local where=$(get_salt_where_from "${1:-admin}")
-      log "Listing pillars (in '$where')"
-      exec_salt -C "$where" pillar.ls
-      ;;
-    get)
-      local pillar="$1"
-      [ -n "$pillar" ] || abort "no pillar provided"
-      local where=$(get_salt_where_from "${2:-admin}")
-      log "Getting pillar '$pillar' (in '$where')"
-      exec_salt -C "$where" pillar.get "$pillar"
-      ;;
-    items)
-      local where=$(get_salt_where_from "${1:-admin}")
-      log "Listing pillars (in '$where')"
-      exec_salt -C "$where" pillar.items
-      ;;
-    help|-h|--help)
-      pillar_usage
-      ;;
-    * )
-      pillar_usage
-      abort "Unknown pillar command $command"
-      ;;
-  esac
-}
-
-########################
-# Salt grains
-########################
-
-grains_usage() {
-  cat<<EOF
-$(basename $CAASPCTL) grains subcommands:
-
-    set '<WHERE>' <GRAIN>=<VALUE>   set a GRAIN in WHERE
-    ls [<WHERE>]                    list all the grains
-    items [<WHERE>]                 get all the grains and contents
-    refresh                         refresh the grains
-
-where <WHERE>  is a Salt expression like 'G@roles:admin' or an alias
-               like "masters", "minions", etc
-               NOTE: default=admin
-EOF
-}
-
-grains_command() {
-  local command=$1
-  shift
-  case "$command" in
-    set)
-      set -f
-      local where=$(get_salt_where_from "${1:-admin}")
-      local key="${2%=*}"
-      local value="${2#*=}"
-      log "Setting grain $key=$value in $where"
-      exec_salt -C "$where" grains.set "$key" "$value"
-      ;;
-    ls|list)
-      local where=$(get_salt_where_from "${1:-admin}")
-      log "Listing grains (in '$where')"
-      exec_salt -C "$where" grains.ls
-      ;;
-    items)
-      local where=$(get_salt_where_from "${1:-admin}")
-      log "Listing grains (in '$where')"
-      exec_salt -C "$where" grains.items
-      ;;
-    refresh|sync|update)
-      salt_command refresh_grains
-      ;;
-    help|-h|--help)
-      grains_usage
-      ;;
-    * )
-      grains_usage
-      abort "Unknown grains command $command"
-      ;;
-  esac
-}
-
-########################
-# Salt keys
-########################
-
-do_salt_key() {
-  exec_in_salt_master /usr/bin/salt-key --force-color "$@"
-}
-
-get_salt_keys_accepted_num() {
-  do_salt_key -l acc | tail -n +2 | wc -l
-}
-
-# accept all keys and print the number of keys accepted so far
-do_salt_keys_accept_all() {
-  do_salt_key --accept-all --yes &>/dev/null
-  get_salt_keys_accepted_num
-}
-
-wait_for_num_keys_accepted() {
-  local num_keys=$1
-  local count=0
-  until [ `do_salt_keys_accept_all` -ge $num_keys ] ; do
-    left=$((CONTAINER_START_TIMEOUT - count))
-    log "Waiting for $num_keys Salt keys to be accepted: $(get_salt_keys_accepted_num) accepted ($left secs left)..."
-    sleep 5
-    [ "$count" -gt "$CONTAINER_START_TIMEOUT" ] && abort "timeout waiting for $num_keys to be accepted"
-    count=$((count+5))
-  done
-}
-
-keys_usage() {
-  cat<<EOF
-$(basename $CAASPCTL) keys subcommands:
-
-    accept-all          accept all the unaccepted keys
-    accept-wait <NUM>   keep accepting keys until we have <NUM> keys accepted
-    accept <KEY>        accept the key <KEY>
-    delete <KEY>        delete the key <KEY>
-    ls|list             list all the keys
-
-EOF
-}
-
-keys_command() {
-  local command=$1
-  shift
-  case "$command" in
-    accept-all)
-      log_sys_hr "Accepting all unaccepted keys"
-      do_salt_keys_accept_all >/dev/null
-      do_salt_key --list-all $@
-      ;;
-
-    ls|list)
-      do_salt_key --list all
-      ;;
-
-    accept-wait|wait)
-      wait_for_num_keys_accepted $@
-      ;;
-
-    accept)
-      do_salt_key -y -a $@
-      ;;
-
-    delete)
-      do_salt_key -y -d $@
-      ;;
-
-    help|-h|--help)
-      keys_usage
-      ;;
-
-    * )
-      keys_usage
-      abort "Unknown keys command $command"
-      ;;
-  esac
-}
-
-########################
-# Salt keys
-########################
-
-logs_usage() {
-  cat<<EOF
-$(basename $CAASPCTL) logs subcommands:
-
-    salt           dump Salt master logs
-    api            dump Salt API logs
-    velum          dump Velum logs
-    mariadb|db     dump MariaDB logs
-    <CONT>         dump the logs for container <CONT>
-    events         show all the Salt events
-
-    (run $(basename $CAASPCTL) logs events --help for more details)
-
-EOF
-}
-
-do_logs_container() {
-  local cid=$(get_cid $1)
-  local name="$2"
-  [ -n "$cid" ] || abort "could not get the $name container... are you sure it is running here?"
-
-  local path=$(docker inspect --format='{{.LogPath}}' $cid)
-  [ -n "$path" ] || abort "could not find the path to logs for $name"
-  log "Dumping $name logs..."
-  cat "$path"
-}
-
-logs_command() {
-  local command=$1
-  shift
-  case "$command" in
-    salt)
-      do_logs_container "salt-master" "Salt master" $@
-      ;;
-
-    api|API)
-      do_logs_container "api" "Salt API" $@
-      ;;
-
-    velum)
-      do_logs_container "velum" "Velum" $@
-      ;;
-
-    mariadb|maria|db|mysql)
-      do_logs_container "mariadb" "MariaDB" $@
-      ;;
-
-    events*)
-      $CAASPCTL db $command $@
-      ;;
-
-    help|-h|--help)
-      logs_usage
-      ;;
-
-    * )
-      [ -z "$command" ] && logs_usage && exit 0
-      do_logs_container "$command" "$command" $@
-      ;;
-  esac
-}
-
-########################
-# kubeconfig
-########################
-
-k8s_kubeconfig() {
-  log "Generating admin certificates"
-
-  local ca_key="$CERT_CA_DIR/private/ca.key"
-  local ca_crt="$CERT_CA_DIR/ca.crt"
-
-  [ -f $ca_key      ] || abort "no ca.key found at $ca_key"
-  [ -f $ca_crt      ] || abort "no ca.crt found at $ca_crt"
-
-  mkdir -p $CERT_ADMIN_DIR
-  cd $CERT_ADMIN_DIR
-
-  rm -f $CERT_ADMIN_DIR/admin.{crt,key}
-  openssl genrsa -out $CERT_ADMIN_DIR/admin.key 2048
-  openssl req -new -key $CERT_ADMIN_DIR/admin.key \
-    -out $CERT_ADMIN_DIR/admin.csr \
-    -subj "/CN=$K8S_ADMIN_USER/O=system:masters"
-  openssl x509 -req -in $CERT_ADMIN_DIR/admin.csr \
-    -CA $ca_crt -CAkey $ca_key -CAcreateserial \
-    -out $CERT_ADMIN_DIR/admin.crt -days 365
-  rm -f $CERT_ADMIN_DIR/admin.csr
-
-  log "Generating a valid kubectl configuration for $API_SERVER_URL"
-  kubectl config set-cluster default-cluster \
-    --embed-certs=true \
-    --server="$API_SERVER_URL" \
-    --certificate-authority="$ca_crt"
-
-  kubectl config set-credentials "$K8S_ADMIN_USER" \
-    --embed-certs=true \
-    --certificate-authority="$ca_crt" \
-    --client-key="$CERT_ADMIN_DIR/admin.key" \
-    --client-certificate="$CERT_ADMIN_DIR/admin.crt"
-
-  kubectl config set-context default-system \
-    --cluster=default-cluster --user="$K8S_ADMIN_USER"
-  kubectl config use-context default-system
-
-  log "Done!"
-  warn "You may need to do:"
-  warn "kubectl create clusterrolebinding cluster-admin-binding --clusterrole=cluster-admin --user=$K8S_ADMIN_USER"
-  warn "in a master machine"
-  log "(you could get the config file from"
-  log "$HOME/.kube/config to some other machine)"
-}
-
-k8s_usage() {
-  cat<<EOF
-$(basename $CAASPCTL) k8s subcommands:
-
-    kubeconfig        generate a kubeconfig file
-    get-apiserver     print the API server hostname
-
-EOF
-}
-
-k8s_command() {
-  local command=$1
-  shift
-  case "$command" in
-    kubeconfig)
-      k8s_kubeconfig
-      ;;
-    get-apiserver|get-master)
-      echo $(get_master_name)
-      ;;
-    help|-h|--help)
-      k8s_usage
-      ;;
-    * )
-      k8s_usage
-      abort "Unknown k8s subcommand $command"
-      ;;
-  esac
-}
-
-########################
-# salt
-########################
-
-# run a command in the Salt master
-exec_in_salt_master() {
-  wait_for_container salt-master
-  exec_in_container salt-master "$@"
-}
-
-exec_salt()     { exec_in_salt_master /usr/bin/salt $SALT_OPTS "$@" ; }
-exec_salt_run() { exec_in_salt_master /usr/bin/salt-run $SALT_OPTS "$@" ; }
-
-salt_usage() {
-  cat<<EOF
-$(basename $CAASPCTL) salt subcommands:
-
-    logs <FLAGS>      dump the Salt master logs (A)
-    events            listen for Salt events (A)
-    sync              synchronize Salt grains, pillar, etc (A)
-    enter             enter the Salt master container (A)
-    restart           restart the Salt Master and API containers (A)
-    restart-api       restart the Salt API container (A)
-    restart-master    restart the Salt master container (A)
-    refresh-pillar    refresh the pillar
-    refresh-grains    refresh the grains
-    set-master <ADDR> set the Salt master address (W)
-    <COMMAND>         run a command like 'salt <COMMAND>' (ie, "$(basename $CAASPCTL) salt '*' test.ping") (A)
-
-(A) only in the Admin Node
-(W) only in Worker Nodes
-
-EOF
-}
-
-do_salt_sync()        { exec_salt "*" saltutil.sync_all refresh=True ; }
-do_salt_sync_pillar() { exec_salt "*" saltutil.sync_pillar refresh=True ; }
-
-salt_command() {
-  set -f
-  local args="$@"
-  local command=$1
-  shift
-  case "$command" in
-    run)
-      exec_salt_run $@
-      ;;
-
-    logs)
-      c=$(get_cid $CONTAINER_SALT_MASTER)
-      [ -n "$c" ] || abort "could not get the Salt master container... are you sure it is running here?"
-      log "Dumping Salt logs..."
-      docker logs $@ $c
-      ;;
-
-    events)
-      log "Dumping Salt events..."
-      exec_salt_run state.event pretty=true
-      ;;
-
-    sync|refresh|update)
-      log_sys_hr "Synchronizing all"
-      do_salt_sync
-      ;;
-
-    refresh_grains|refresh-grains)
-      log_sys "Refreshing grains..."
-      exec_salt "*" saltutil.refresh_grains
-      log_sys "Refresh: done"
-      ;;
-
-    refresh_pillar|refresh-pillar)
-      log_sys "Refreshing pillar..."
-      exec_salt "*" saltutil.refresh_pillar
-      log_sys "Refresh: done"
-      ;;
-
-    enter)
-      log "Entering Salt container..."
-      docker exec -ti $(get_cid $CONTAINER_SALT_MASTER) /bin/sh
-      log "(exited the Salt container)"
-      ;;
-
-    restart)
-      $CAASPCTL salt restart-master
-      $CAASPCTL salt restart-api
-      ;;
-
-    restart-master)
-      restart_container salt-master
-      ;;
-
-    restart-api)
-      restart_container salt-api
-      ;;
-
-    set-master)
-      local new_admin="$1"
-      [ -n "$new_admin" ] || abort "no IP/hostname provided for 'set-master'"
-      local current_admin=$(cat $SALT_MASTER_CONFIG_FILE | cut -f2 -d' ')
-      if [ -z "$current_admin" ] || [ "$current_admin" != "$new_admin" ] ; then
-        echo "master: $new_admin" > $SALT_MASTER_CONFIG_FILE
-        systemctl restart salt-minion
-      fi
-      ;;
-
-    help|-h|--help)
-      salt_usage
-      ;;
-
-    *)
-      # interpret all the args as a Salt command
-      exec_salt $args
-      ;;
-  esac
-}
-
-########################
-# orchestration
-########################
-
-orchestrate_usage() {
-  cat<<EOF
-$(basename $CAASPCTL) orch subcommands:
-
-    prepare                prepare an orchestration, loading pillars and so...
-    orch [ORCH [ARGS ...]] prepare and run an orchestration
-    fast [ORCH [ARGS ...]] just run the orchestration
-    rm <ID>                run the removal orchestration for ID
-    rms <ID>               run the removal orchestration for ID (but skipping it)
-
-where ORCH default value is 'kubernetes'
-
-Examples:
-
-  * for just testing Jinja output
-
-    $(basename $CAASPCTL) orch kubernetes test=True
-
-  * for removing node SOMEID
-
-    $(basename $CAASPCTL) orch rm SOMEID
-
-  * for updating the cluster
-
-    $(basename $CAASPCTL) orch update
-
-  (we can previously set the "fake" update flags with)
-
-    $(basename $CAASPCTL) orch update-set-needed
-
-EOF
-}
-
-do_prepare_orchestration() {
-  log_sys_hr "Preparing orchestration: setting pillars"
-  for pillar_lst in $PILLARS_FILES ; do
-    [ -f $pillar_lst ] && do_pillar_load_file $pillar_lst
-  done
-
-  # some pillars that must be set dynamically
-  log "Setting some dynamic pillars..."
-  local admin_ip=$(default_iface_ip)
-  do_pillar_add "dashboard" "$admin_ip"
-  do_pillar_add "dashboard_external_fqdn" "$admin_ip"
-}
-
-do_orchestrate() {
-  local orchestration=${1:-$ORCH_DEFAULT}
-  shift
-
-  keys_command accept-all
-
-  log_sys_hr "Synchronizing all"
-  do_salt_sync
-
-  log_sys_hr "Starting the '$orchestration' orchestration..."
-  [ $# -gt 0 ] && log_sys "Orchestration arguments: $@"
-  salt_command run $ORCH_OPTS state.orchestrate "orch.$orchestration" $@ | tee $ORCH_LOG
-  log_sys "'$orchestration' orchestration finished"
-}
-
-orchestrate_command() {
-  local command=$1
-  [ -n "$command" ] || command="orchestrate"
-  shift
-  case "$command" in
-
-    prepare)
-      do_prepare_orchestration
-      ;;
-
-    orchestrate-fast|orch-fast|fast)
-      do_orchestrate $@
-      ;;
-
-    orchestrate|orch)
-      $CAASPCTL orchestrate prepare
-      $CAASPCTL orchestrate fast $@
-      ;;
-
-    update-set-needed)
-      log_sys "Setting $UPDATE_GRAIN=true"
-      grains_command set masters $UPDATE_GRAIN=true
-      grains_command set minions $UPDATE_GRAIN=true
-      ;;
-
-    rm)
-      target=$1
-      $CAASPCTL orchestrate $ORCH_REMOVAL pillar='{"target":"'$target'"}'
-      ;;
-
-    rms)
-      target=$1
-      $CAASPCTL orchestrate $ORCH_REMOVAL pillar='{"target":"'$target'","skip":"true"}'
-      ;;
-
-    add)
-      targets_lst=`as_json_lst $@`
-      $CAASPCTL orchestrate $ORCH_ADDITION pillar='{"targets":'$targets_lst'}'
-      ;;
-
-    help|-h|--help)
-      orchestrate_usage
-      ;;
-
-    *)
-      orchestrate_command orch $command $@
-      abort "Unknown orchestration argument $command"
-      ;;
-  esac
-}
-
-########################
-# RW
-########################
-
-rw_command() {
-  local command=$1
-  shift
-  case "$command" in
-    start|enable|true|on|1)
-      log_sys "Making the FS read-writeable"
-      btrfs property set -ts /.snapshots/1/snapshot ro false
-      mount -o remount,rw /
-      ;;
-    stop|disable|false|off|0)
-      warn "not implemented yet"
-      ;;
-    *)
-      abort "Unknown argument $command"
-      ;;
-  esac
-}
-
-########################
-# Velum
-########################
-
-exec_velum_salt_fun() {
-  local fun=$1
-  log "Salt.$fun:"
-  exec_in_container "$CONTAINER_VELUM" \
-    entrypoint.sh bash -c \
-    "$RAILS_EXE runner \"require 'velum/salt'; require 'pp' ; pp(Velum::Salt.$fun)\""
-  log "Salt.$fun done!"
-}
-
-velum_usage() {
-  cat<<EOF
-$(basename $CAASPCTL) velum subcommands:
-
-    enter                enter the Velum container
-    logs                 dump the Velum logs
-    fun <FUNCTION>       run the Salt <FUNCTION>
-
-Orchestrations:
-
-    orch|orchestrate     run the orchestration
-    update               run the update orchestration
-
-Minions:
-
-    minions              get the list of minions
-    accept-minion <ID>   accept a minion
-    pending-minions      get the list of pending minions
-
-EOF
-}
-
-velum_command() {
-  local command=$1
-  shift
-  case "$command" in
-    orch|orchestrate)
-      $CAASPCTL salt refresh
-      exec_velum_salt_fun "orchestrate"
-      ;;
-
-    update)
-      $CAASPCTL salt refresh
-      exec_velum_salt_fun "update_orchestration"
-      ;;
-
-    logs)
-      $CAASPCTL logs velum
-      ;;
-
-    minions)
-      exec_velum_salt_fun "minions"
-      ;;
-
-    pending|pending-minions)
-      exec_velum_salt_fun "pending_minions"
-      ;;
-
-    accept|accept-minion)
-      for i in $@ ; do
-        exec_velum_salt_fun "accept_minion(minion_id: '$i')"
-      done
-      ;;
-
-    fun|function|f|call|run)
-      exec_velum_salt_fun $@
-      ;;
-
-    enter)
-      log "Entering Velum container..."
-      docker exec -ti $(get_cid $CONTAINER_VELUM) /bin/sh
-      log "(exited the Velum container)"
-      ;;
-
-    enter-db|enter-mariadb)
-      log "Entering MariaDB..."
-      local pass=$(cat /var/lib/misc/infra-secrets/mariadb-root-password)
-      docker exec -ti $(get_cid $CONTAINER_MARIADB)  mysql -uroot -p$pass
-      log "(exited MariaDB)"
-      ;;
-
-    help|-h|--help)
-      velum_usage
-      ;;
-
-    * )
-      velum_usage
-      abort "Unknown velum subcommand $command"
-      ;;
-  esac
-}
-
-
-########################
-# Database
-########################
-
-QUERY_EVENTS='SELECT data FROM salt_events ORDER BY alter_time;'
-
-exec_in_db_raw() {
-  local pass="$(cat /var/lib/misc/infra-secrets/mariadb-root-password)"
-  exec_in_container "$CONTAINER_MARIADB" \
-    mysql -uroot "-p$pass" -B -e "$@" $VELUM_DB
-}
-
-exec_in_db() {
-  local pass="$(cat /var/lib/misc/infra-secrets/mariadb-root-password)"
-  exec_in_container "$CONTAINER_MARIADB" \
-    mysql -uroot "-p$pass" -B -t -e "$@" $VELUM_DB
-}
-
-pretty_print_salt_events() {
-  local expr=$1
-  shift
-
-  exec_in_db_raw "$expr" | python -c "$PYTHON_FILTER_JID" $@
-}
-
-db_usage() {
-  cat<<EOF
-$(basename $CAASPCTL) db subcommands:
-
-    enter            enter MariaDB
-    logs             dump the MariaDB container logs
-    pillar           show the Salt pillar
-    minions          show the Minions in the database
-    tables           show the DB tables
-    exec <QUERY>     run a custom query (note: use single quotes)
-    events           show all the Salt events
-
-    (run $(basename $CAASPCTL) db events --help for more details)
-
-EOF
-}
-
-db_command() {
-  set -f
-  local command=$1
-  shift
-  case "$command" in
-    enter)
-      log "Entering MariaDB..."
-      local pass=$(cat /var/lib/misc/infra-secrets/mariadb-root-password)
-      docker exec -ti $(get_cid $CONTAINER_MARIADB)  mysql -uroot -p$pass $VELUM_DB
-      log "(exited MariaDB)"
-      ;;
-
-    logs)
-      $CAASPCTL logs db
-      ;;
-
-    pillar)
-      exec_in_db 'SELECT * FROM pillars;'
-      ;;
-
-    tables)
-      exec_in_db 'SHOW TABLES;'
-      ;;
-
-    minions)
-      exec_in_db 'SELECT * FROM minions;'
-      ;;
-
-    events)
-      exec_in_db_raw "$QUERY_EVENTS" | python $PYTHON_EVENTS_PROC --infile-lines $@
-      ;;
-
-    exec|run|f|fun)
-      exec_in_db $@
-      ;;
-
-    help|-h|--help)
-      db_usage
-      ;;
-
-    * )
-      db_usage
-      abort "Unknown db subcommand $command"
-      ;;
-  esac
-}
-
-########################
+# TMP_REGISTRY_CNF=/tmp/registry-openssl.cnf
+#
+# CA_CRT="$REGISTRY_CERTS_DIR/ca.pem"
+# CA_KEY="$REGISTRY_CERTS_DIR/ca-key.pem"
+# CA_CSR="$REGISTRY_CERTS_DIR/ca.csr"
+#
+# REG_CRT="$REGISTRY_CERTS_DIR/registry.pem"
+# REG_KEY="$REGISTRY_CERTS_DIR/registry-key.pem"
+# REG_CSR="$REGISTRY_CERTS_DIR/registry.csr"
+#
+#
+# reg_gen_certs() {
+#   mkdir -p "$REGISTRY_CERTS_DIR"
+#   rm -f "$REG_KEY" "$REG_CRT" "$REG_CSR"
+#
+#   if [ -z "$REGISTRY_IP" ] ; then
+#     REGISTRY_IP=$(default_iface_ip)
+#     [ -n "$REGISTRY_IP" ] || abort "could not guess default interface IP"
+#   fi
+#
+#   log "Generating openssl config"
+#   echo "[req]" >$TMP_REGISTRY_CNF
+#   echo "prompt                      = no" >>$TMP_REGISTRY_CNF
+#   echo "req_extensions              = v3_req" >>$TMP_REGISTRY_CNF
+#   echo "distinguished_name          = req_distinguished_name" >>$TMP_REGISTRY_CNF
+#   echo "[ req_distinguished_name ]" >>$TMP_REGISTRY_CNF
+#   echo "countryName                 = US" >>$TMP_REGISTRY_CNF
+#   echo "stateOrProvinceName         = Somewhere" >>$TMP_REGISTRY_CNF
+#   echo "localityName                = Somewhere" >>$TMP_REGISTRY_CNF
+#   echo "organizationName            = SUSE" >>$TMP_REGISTRY_CNF
+#   echo "commonName                  = $REGISTRY_HOSTNAME" >>$TMP_REGISTRY_CNF
+#   echo "[ v3_req ]" >>$TMP_REGISTRY_CNF
+#   echo "basicConstraints            = CA:FALSE" >>$TMP_REGISTRY_CNF
+#   echo "keyUsage                    = nonRepudiation, digitalSignature, keyEncipherment" >> $TMP_REGISTRY_CNF
+#   echo "subjectAltName              = @alt_names" >>$TMP_REGISTRY_CNF
+#   echo "[alt_names]" >>$TMP_REGISTRY_CNF
+#   echo "DNS.1                       = $REGISTRY_HOSTNAME.local" >>$TMP_REGISTRY_CNF
+#   echo "DNS.2                       = $REGISTRY_HOSTNAME" >>$TMP_REGISTRY_CNF
+#   echo "IP.1                        = $REGISTRY_IP" >>$TMP_REGISTRY_CNF
+#
+#   log "Generating CA"
+#   openssl genrsa -out "$CA_KEY" 4096
+#   openssl req -new -x509 -days 1826 \
+#     -key "$CA_KEY" -out "$CA_CRT" \
+#     -config "$TMP_REGISTRY_CNF"
+#
+#   log "Generating registry's private key"
+#   openssl genrsa -out "$REG_KEY" 2048
+#
+#   log "Generating registry's certificate signing request (CSR)"
+#   openssl req -new \
+#     -key "$REG_KEY" -out "$REG_CSR" \
+#     -subj "/CN=$REGISTRY_HOSTNAME" \
+#     -config "$TMP_REGISTRY_CNF"
+#
+#   log "Signing registry's CSR with CA key"
+#   openssl x509 -req \
+#     -CA "$CA_CRT" -CAkey "$CA_KEY" \
+#     -CAcreateserial \
+#     -in "$REG_CSR" -out "$REG_CRT" \
+#     -days 365 \
+#     -extensions v3_req \
+#     -extfile "$TMP_REGISTRY_CNF"
+#
+#   rm -f "$TMP_REGISTRY_CNF"
+#
+#   log "Dumping certificate information:"
+#   openssl x509 -in "$REG_CRT" -text -noout
+#   log "Done. Certificates stored at $REGISTRY_CERTS_DIR"
+# }
+#
+# reg_dump_catalog() {
+#   log "Dumping registry catalog"
+#   CURL_ARGS=
+#   if [ -f "$CA_CRT" ] ; then
+#     CURL_ARGS="$CURL_ARGS --cacert $CA_CRT"
+#     CATALOG_URL="https://$REGISTRY/v2/_catalog"
+#   else
+#     CATALOG_URL="http://$REGISTRY/v2/_catalog"
+#   fi
+#   curl $CURL_ARGS "$CATALOG_URL"
+# }
+#
+# reg_start() {
+#   [ -f "$REG_KEY" ] || $CAASPCTL certs
+#   [ -f "$REG_KEY" ] || abort "no certificate found at $REG_KEY"
+#
+#   log "Starting the registry"
+#   docker run -d -p $REGISTRY_PORT:$REGISTRY_PORT \
+#     --restart=always --name registry \
+#     -v $REGISTRY_CERTS_DIR:/certs \
+#     -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/$(basename "$REG_CRT") \
+#     -e REGISTRY_HTTP_TLS_KEY=/certs/$(basename "$REG_KEY") \
+#     $CONTAINER_REGISTRY:$CONTAINER_REGISTRY_TAG
+# }
+#
+# reg_import() {
+#   local image_name="$1"
+#
+#   log "Pulling $image_name"
+#   docker pull "$image_name"
+#
+#   local image_hash=$(docker images | grep "$image_name" | grep latest | awk '{ print $3 }')
+#
+#   log "Tagging $image_hash as $REGISTRY/$image_name"
+#   docker tag "$image_hash" "$REGISTRY/$image_name"
+#
+#   log "Pushing $REGISTRY/$image_name"
+#   docker push "$REGISTRY/$image_name"
+#
+#   $CAASPCTL registry status
+# }
+
+#########################
+# events parsing
+#########################
+
+def parse_orch_by_node(it, filter_orch_last=False):
+    '''
+    Return a list of dictionaries, one per node, with
+    the list of steps in the orchestration
+
+    res = {
+      'node1': [
+        {
+            'name': 'etc_hosts_setup',
+            'start': '07:51:35.348935',
+            'end': '07:51:37.658765',
+            'result': 'true',
+        },
+      ]
+    }
+    '''
+    res = {}
+
+    def add_for_node(node, **kwargs):
+        if not node in res:
+            res[node] = []
+
+        action_dict = {key: 'unknown' for key in CSV_FIELDS}
+        action_dict.update({
+            'node': node,
+            'start': datetime.now(),
+            'end': datetime.now(),
+        })
+        action_dict.update(kwargs)
+        res[node].append(action_dict)
+
+    def get_name_for_action(action_name):
+        comps = action_name.split('|')
+        name = ''.join(comps[:2])
+
+        # cleanup some nasty chars
+        name = name.replace('_\n', '\n')
+        name = name.replace('_-', ':')
+        return name
+
+    def get_times_from_action(action):
+        '''
+        Parse times like:
+
+        "duration": 10721.716,
+        "start_time": "17:12:22.273274"
+        '''
+        start_time = action['start_time']
+        duration = action['duration']
+
+        start_time = datetime.strptime(start_time, '%H:%M:%S.%f')
+        end_time = start_time + timedelta(seconds=float(duration))
+        return start_time, end_time
+
+    def parse_action(name, action, **kwargs):
+        if isinstance(action, dict):
+            try:
+                result = action['result']
+            except KeyError as e:
+                log.debug('no result in %s', str(action))
+                return
+
+            try:
+                start_time, end_time = get_times_from_action(action)
+            except KeyError as e:
+                log.debug('cannot parse times in %s', str(action))
+                return
+
+            action_dict = {
+                'stage': stage,
+                'name': name,
+                'start': start_time,
+                'end': end_time,
+                'jid': jid,
+                'result': result,
+            }
+            action_dict.update(kwargs)
+            add_for_node(node, **action_dict)
+
+    def parse_actions(node, actions, **kwargs):
+        '''
+        Parse a list of actions like:
+
+            "caasp_cri_|-haproxy-restart_|-haproxy_|-stop_container_and_wait": {
+                "__id__": "haproxy-restart",
+                "__run_num__": 41,
+                "changes": {},
+                "comment": "kube-system.haproxy successfully restarted",
+                "duration": 10721.716,
+                "name": "haproxy",
+                "namespace": "kube-system",
+                "result": true,
+                "start_time": "17:12:22.273274"
+            },
+        '''
+        for action_name, action in actions.items():
+            name = get_name_for_action(action_name)
+            parse_action(name, action, **kwargs)
+
+    for data in it:
+        if 'return' not in data:
+            # we are only interested in 'returns'
+            continue
+
+        jid = data['jid']
+        fun = data['fun']
+
+        if fun in ['state.highstate', 'state.sls']:
+            node = data['id']
+            actions = data['return']
+            retcode = int(data['retcode'])
+            stage = 'highstate' if fun == 'state.highstate' else 'sls'
+
+            if retcode != 0:
+                # this is an error
+                msg = 'ERROR: ' + actions[0][:20] + '...'
+                add_for_node(node, stage='highstate', name=msg, jid=jid, result=False)
+            else:
+                parse_actions(node, {node: actions.values()}, stage=stage, jid=jid)
+
+        elif fun == "runner.state.orchestrate":
+            orch_name = data['fun_args'][0]
+            return_data = data['return']['data']
+            steps = return_data[return_data.keys()[0]]
+            for step in steps.values():
+                stage = step.get('__id__', 'unknown')
+
+                try:
+                    step_changes = step['changes']
+                except (KeyError, TypeError) as e:
+                    continue
+
+                if isinstance(step_changes, bool):
+                    name = get_name_for_action(step['name'])
+                    parse_action(name, step, orch=orch_name, stage=stage, jid=jid)
+                elif isinstance(step_changes, dict):
+                    try:
+                        orch_steps = step_changes['ret']
+                    except (KeyError, TypeError) as e:
+                        name = get_name_for_action(step['name'])
+                        parse_action(name, step, orch=orch_name, stage=stage, jid=jid)
+                    else:
+                        for node, actions in orch_steps.items():
+                            if not isinstance(actions, dict):
+                                continue
+                            parse_actions(node, actions, orch=orch_name,
+                                          stage=stage, jid=jid)
+
+    res_lst = []
+    for node in res:
+        for action in res[node]:
+            item = {'node': node}
+            item.update(action)
+            res_lst.append(item)
+
+    res_lst.sort(key=lambda x: x['start'])
+
+    if filter_orch_last:
+        last_jid = res_lst[-1]['jid']
+        res_lst = [x for x in res_lst if x['jid'] == last_jid]
+
+    return res_lst
+
+
+####################################################################
+# Command-line processing
+####################################################################
+
+
+class CommandError(Exception):
+    pass
+
+
+class CmdBase(Cmd):
+
+    def __init__(self, top=None):
+        Cmd.__init__(self)
+        self.last_exc = None
+        self.blocked = False
+        self.current_script = ''
+        self.top = top
+
+    def abort(self):
+        self.do_traceback('')
+        log.critical(on_color('RED', 'aborting execution'))
+        sys.exit(1)
+
+    def is_interactive(self):
+        if self.top:
+            return self.top.is_interactive()
+        else:
+            return (self.stdin == sys.stdin)
+
+    def command_line_args(self, cmd_args):
+        line = ' '.join(cmd_args)
+        for command in line.split(';'):
+            self.onecmd(command)
+
+    def onecmd(self, line):
+        try:
+            if not self.blocked or line == 'EOF' or line.startswith('stage'):
+                return Cmd.onecmd(self, line)
+            else:
+                return False
+        except subprocess.CalledProcessError as e:
+            log.info(on_color('RED', 'Command error: ' + str(e)))
+            if args.exit_on_err or not self.is_interactive():
+                self.abort()
+        except KeyboardInterrupt as e:
+            log.info(on_color('RED', '[interrupted]'))
+            if args.exit_on_err or not self.is_interactive():
+                self.last_exc = sys.exc_info()
+                self.abort()
+
+    def cmdloop(self, intro=None):
+        self.interactive = True
+
+        if self.intro:
+            print(self.intro)
+
+        while True:
+            try:
+                Cmd.cmdloop(self, intro="")
+                self.postloop()
+                break
+            except subprocess.CalledProcessError as e:
+                log.info(on_color('RED', 'Command error: ' + str(e)))
+                if args.exit_on_err or not self.is_interactive():
+                    self.abort()
+            except KeyboardInterrupt as e:
+                log.info(on_color('RED', '[interrupted]'))
+                if args.exit_on_err or not self.is_interactive():
+                    self.last_exc = sys.exc_info()
+                    self.abort()
+            except Exception as e:
+                self.last_exc = sys.exc_info()
+
+                if not self.is_interactive():
+                    # we are running in batch mode
+                    log.critical(on_color('RED', 'exception catched in batch mode: %s'), e)
+                    self.abort()
+
+                log.critical(on_color('RED', 'exception catched !!! %s'), e)
+                log.critical(on_color('RED', 'get more details with "traceback".'))
+
+    def precmd(self, line):
+        if line.lstrip().startswith('#'):
+            return ''
+
+        if len(line.strip()) == 0:
+            return line
+
+        # replace all the `some-shell-command`
+        def sh_replacer(text):
+            cmd = text[1:-1]  # remove the ``
+            log.debug('replacing %s by shell output', cmd)
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True)
+            return out.decode('utf-8').rstrip()
+        line = replace_pattern(r"`.*`", sh_replacer, line)
+
+        # replace all the {% some-python-code %}
+        def python_replacer(text):
+            code = text[2:-2]  # remove the {%%}
+            log.debug('replacing %s by python evaluation', code)
+            return str(self.eval(code))
+        line = replace_pattern(r"\{\%.*\%\}", python_replacer, line)
+
+        line = expandvars(line)
+
+        return line
+
+    def default(self, line):
+        line = line.lstrip()
+
+        if line.startswith('>'):
+            # evaluate python code
+            return self.do_eval(line[1:])
+
+        if line.startswith('!'):
+            # run a local command
+            return self.do_sh(line[1:])
+
+        if line == '..':
+            return True
+
+        Cmd.default(self, line)
+
+    def try_rc_files(self, rc_files):
+        log.debug('Trying to load RC files...')
+        for maybe_rc_file in rc_files:
+            maybe_rc_file = os.path.expandvars(maybe_rc_file)
+            if os.path.exists(maybe_rc_file):
+                try:
+                    self.load_script(maybe_rc_file)
+                except Exception as e:
+                    log.critical('Could not read rc file %s: %s', maybe_rc_file, e)
+                    sys.exit(1)
+
+    def load_script(self, script):
+        log.info('Loading commands from "%s"', script)
+
+        old_stdin = caasp_cmd.stdin
+        old_prompt = caasp_cmd.prompt
+        old_intro = caasp_cmd.intro
+        old_use_rawinput = caasp_cmd.use_rawinput
+
+        self.use_rawinput = False
+        self.prompt = ''
+        self.intro = ''
+        self.current_script = os.path.abspath(script)
+
+        try:
+            with open(script, 'rt') as script_fd:
+                self.stdin = script_fd
+                self.cmdloop()
+        finally:
+            script_fd.close()
+
+            # restore the previous settings
+            self.stdin = old_stdin
+            self.prompt = old_prompt
+            self.intro = old_intro
+            self.use_rawinput = old_use_rawinput
+            self.current_script = ''
+
+    def do_load(self, line):
+        '''
+        Load a script with commands.
+        '''
+        filename = line
+        if not os.path.isabs(filename):
+            this_filename = os.path.realpath(__file__)
+            this_dirname = os.path.dirname(this_filename)
+            cur_script_dirname = os.path.dirname(self.current_script)
+
+            log.debug('try to guess the real name of %s', filename)
+            for i in [filename,
+                      os.path.join(this_dirname, filename),
+                      os.path.join(cur_script_dirname, filename)]:
+                log.debug('trying %s', i)
+                if os.path.exists(i):
+                    filename = i
+                    break
+
+        if os.path.exists(filename):
+            self.load_script(filename)
+        else:
+            log.error('could not load script at %s', filename)
+
+    def complete_do_load(self, text, line, start_idx, end_idx):
+        return complete_path(text)
+
+    def do_shell(self, line):
+        '''
+        Run a shell command in the local machine.
+        Notes:
+
+        * there is shortcut with the ! character (ie, "! ls -lisa")
+
+        Usage:
+
+        > sh ls /
+        > sh cat README.txt
+        > ! ls /
+        '''
+        if execute_interactive(line) != 0:
+            log.error('command failed')
+
+    def do_traceback(self, line):
+        '''Get a traceback for the last exception. '''
+        if self.last_exc:
+            traceback.print_exception(*self.last_exc)
+            self.last_exc = None
+
+    def do_quiet(self, line):
+        '''Set quiet mode.'''
+        args.debug = False
+        return True
+
+    def do_print(self, line):
+        '''Quit.'''
+        log.info(line)
+
+    def do_EOF(self, line):
+        return True
+
+    def do_quit(self, line):
+        '''Quit.'''
+        return self.do_EOF(line)
+
+    def eval(self, code):
+        gl = globals()
+        return eval(code, {'root': gl['caasp_cmd']}, {})
+
+    def do_eval(self, line):
+        print(self.eval(line))
+
+    def emptyline(self):
+        # ignore empty lines instead of repeating last command
+        pass
+
+    def do_stage(self, line):
+        '''
+        Mark the beginning of a new stage.
+        '''
+        if not line:
+            raise CommandError('no stage specified')
+
+        stage = line
+        log.debug('reached stage "%s" (waiting "%s")s', stage, args.script_begin)
+        if str(stage) == str(args.script_begin):
+            log.debug('stage %s reached: unblocking input', args.script_begin)
+            self.blocked = False
+
+
+###################
+# Salt stuff
+###################
+
+class CaaSPSalt(CmdBase):
+
+    prompt = prompt('caaspctl:salt')
+
+    def default(self, line):
+        '''
+        Run a raw command in the Salt master container
+
+        Usage:
+
+        > salt '*' test.ping
+        '''
+        log.info('Running Salt command %s', line)
+        print_iterator(exec_in_container('salt', 'salt ' + line))
+
+    def do_sync(self, line):
+        '''
+        Perform a Salt synchronization.
+        By default, "all" is synchronized.
+
+        > salt sync
+        > salt sync grains
+        '''
+        if line:
+            print_iterator(salt_sync(line))
+        else:
+            print_iterator(salt_sync())
+
+    def do_enter(self, line):
+        '''
+        Enter into the Salt master container
+        '''
+        return CmdBase.do_enter(self, 'salt-master')
+
+    def do_attach(self, line):
+        '''
+        Attach to Salt master container
+
+        Notes:
+
+        * once you are attached, a ctrl-C will interrupt the Salt Master
+
+        '''
+        log.info('Attaching to Salt master container')
+        attach_container('salt-master')
+
+    def do_apply(self, line):
+        '''
+        Apply a state on the machines that match <WHERE>
+
+        Usage:
+
+        > salt apply masters etc-hosts
+        > salt apply "G@roles:ca" haproxy
+        > salt apply 'G@caasp_etcd_member' etcd.remove-pre-stop-services
+        '''
+        line_comps = line.split(' ')
+        if len(line_comps) < 2:
+            raise CommandError('insufficient arguments')
+
+        where = get_salt_where_from(line_comps[0])
+        state = line_comps[1]
+
+        cmd_args = ''
+        if len(line_comps) > 2:
+            cmd_args = line_comps[2:]
+
+        print_iterator(salt_sync())
+
+        log.info('Applying %s on %s', state, where)
+        out_it = exec_in_salt('state.apply {} {}'.format(state, cmd_args),
+                              compound=where, out='yaml', color=True,
+                              wait=True, debug=args.debug)
+        print_iterator(out_it)
+
+    def do_high(self, line):
+        '''
+        Apply a "highstate" on the machines that match <WHERE>
+
+        Usage:
+
+        > salt high minions high pillar='{"foo":"bar"}'
+        > salt high *
+        '''
+        line_comps = line.split(' ')
+        if len(line_comps) < 1:
+            raise CommandError('insufficient arguments')
+
+        where = get_salt_where_from(line_comps[0])
+        cmd_args = line_comps[1:]
+
+        print_iterator(salt_sync())
+
+        log.info('Applying highstate on %s', where)
+        out_it = exec_in_salt('state.apply {}'.format(cmd_args), compound=where,
+                              out='yaml', color=True, wait=True,
+                              debug=args.debug)
+        print_iterator(out_it)
+
+
+class CaaSPEvents(CmdBase):
+
+    prompt = prompt('caaspctl:events')
+
+    def _get_filtered_data(self, filter_jid=None, filter_failed=False, filter_orch=False, filter_state_sls=False):
+        '''
+        Load the JSON file, maybe as a list of JSON lines
+        (as we get from mysql) or as a regular JSON file.
+        '''
+        # filter out the things we are not interested in
+        for data in parse_json_from_iter(exec_sql_in_db(DB_QUERY_EVENTS, wait=True)):
+
+            if filter_jid:
+                if ("jid" in data) and (data["jid"] != filter_jid):
+                    continue
+
+            if filter_failed:
+                if ("success" in data) and (data["success"] != "false"):
+                    continue
+
+            if filter_orch:
+                if "fun" not in data or (data["fun"] != "runner.state.orchestrate"):
+                    continue
+
+            if filter_state_sls:
+                if "fun" not in data or (data["fun"] != "state.sls"):
+                    continue
+
+            yield data
+
+    def do_json(self, line):
+        '''
+        Plot the Salt events as JSON.
+
+        Optional arguments:
+
+        * filter_jid=<ID>: only show JID
+        * filter_failed=[True|False]: : when True, only show failed events
+        * filter_orch=[True|False]: when True, only show orchestrations
+        * filter_state_sls=[True|False]: when True, only show state events
+        '''
+        kwargs = get_assign_from_str(line)
+        for line in self._get_filtered_data(**kwargs):
+            print(json.dumps(line, indent=4, sort_keys=True))
+
+    def do_yaml(self, line):
+        '''
+        Plot the Salt events as YAML.
+
+        Optional arguments:
+
+        * filter_jid=<ID>: only show JID
+        * filter_failed=[True|False]: : when True, only show failed events
+        * filter_orch=[True|False]: when True, only show orchestrations
+        * filter_state_sls=[True|False]: when True, only show state events
+
+        Usage:
+
+        > events yaml filter_orch=True
+        '''
+        kwargs = get_assign_from_str(line)
+        for line in self._get_filtered_data(**kwargs):
+            print(yaml.safe_dump(line, indent=4))
+
+    def do_plot(self, line):
+        '''
+        Plot the Salt events.
+
+        Optional arguments:
+
+        * filter_jid=<ID>: only show JID
+        * filter_failed=[True|False]: : when True, only show failed events
+        * filter_orch=[True|False]: when True, only show orchestrations
+        * filter_state_sls=[True|False]: when True, only show state events
+
+        Usage:
+
+        > events plot filter_orch=True
+        '''
+        kwargs = get_assign_from_str(line)
+        orch_lines = parse_orch_by_node(self._get_filtered_data(**kwargs))
+        save_orch_plot(orch_lines)
+
+    def do_csv(self, line):
+        '''
+        Get a CSV of the Salt events
+
+        Optional arguments:
+
+        * filter_jid=<ID>: only show JID
+        * filter_failed=[True|False]: : when True, only show failed events
+        * filter_orch=[True|False]: when True, only show orchestrations
+        * filter_state_sls=[True|False]: when True, only show state events
+
+        Usage:
+
+        > events csv filter_orch=True
+        '''
+        kwargs = get_assign_from_str(line)
+        orch_lines = parse_orch_by_node(self._get_filtered_data(**kwargs))
+        save_orch_csv(orch_lines)
+
+
+class CaaSPPillar(CmdBase):
+
+    prompt = prompt('caaspctl:pillar')
+
+    def do_set(self, line):
+        '''
+        Set a pillar.
+
+        Usage:
+
+        > pillar set api:server:external_fqdn 192.168.122.4
+        '''
+        line = line.strip()
+        line_comps = [] if not line else line.split(' ')
+
+        if len(line_comps) != 2:
+            raise CommandError('set requires tow arguments: the key and the value')
+
+        key, value = line_comps[0].strip(), line_comps[1].strip()
+        log.info('Setting the %s to %s', key, value)
+        print_iterator(pillar_db_insert(key, value, wait=True))
+
+    def do_load(self, line):
+        '''
+        Load pillar values from a file
+
+        Usage:
+
+        > pillar load /etc/pillars.lst
+        '''
+        filename = line
+        log.info('Loading pillars from %s', filename)
+        wait_for_db()
+        with open(filename, 'r') as f:
+            for line in f.readlines():
+                line = line.strip()
+
+                if not line or line.startswith('#'):
+                    continue
+
+                line_comps = re.split('\s{2,}', line.strip())
+                if len(line_comps) < 2:
+                    log.error('could not parse pillars line: "%s"', line)
+                    continue
+
+                key, value = line_comps[0].strip(), line_comps[1].strip()
+                print_iterator(pillar_db_insert(key, value))
+
+    def do_get(self, line):
+        '''
+        Get a pillar.
+
+        Usage:
+
+        > pillar get ca api:server:external_fqdn
+        '''
+        line = line.strip()
+        line_comps = [] if not line else line.split(' ')
+
+        if len(line_comps) >= 2:
+            key = line_comps[0]
+            where = get_salt_where_from(line_comps[1])
+            cmd = 'pillar.get {key}'.format(**locals())
+        elif len(line_comps) == 1:
+            print(line_comps)
+            where = 'ca'
+            key = line_comps[0]
+            cmd = 'pillar.get {key}'.format(**locals())
+        else:
+            where = 'ca'
+            key = 'all'
+            cmd = 'pillar.items'.format(**locals())
+
+        log.info('Getting %s at %s', key, where)
+        out_it = exec_in_salt(cmd, compound=where, color=True, out='yaml', wait=True)
+        print_iterator(out_it)
+
+    def do_db(self, line):
+        '''
+        Get the list of pillars in the database.
+
+        Usage:
+
+        > pillar db
+        '''
+        log.info('Getting pillar database')
+        print_iterator(exec_sql_in_db(DB_QUERY_PILLAR_CMD, wait=True))
+
+    def do_flush(self, line):
+        '''
+        Flush the pillars database.
+
+        Important: this will not get rid of all the pillars Salt
+                   obtains from the pillar/*.sls files.
+
+        Usage:
+
+        > pillar flush
+        '''
+        log.info('Flushing pillar database')
+        print_iterator(exec_sql_in_db(DB_FLUSH_PILLAR_CMD, wait=True))
+
+    def do_refresh(self):
+        '''
+        Refresh the pillar in the minions.
+        '''
+        log.info('Refreshing pillars')
+        print_iterator(exec_in_salt('saltutil.refresh_pillar', compound='*'))
+
+    def do_guess_dynamic(self, line):
+        '''
+        Guess some dynamic pillars
+
+        Usage:
+
+        > pillar guess_dynamic
+        '''
+        log.info('Guessing some dynamic pillars from infrastructure')
+        wait_for_db()
+
+        admin_ip = default_iface_ip()
+        assert(is_ip(admin_ip))
+        log.debug('using dashboard at %s', admin_ip)
+        print_iterator(pillar_db_insert('dashboard', admin_ip))
+        print_iterator(pillar_db_insert('dashboard_external_fqdn', admin_ip))
+
+        master_ip = get_master_ip()
+        assert(is_ip(master_ip))
+        log.debug('using master at %s', master_ip)
+        print_iterator(pillar_db_insert('api:server:external_fqdn', master_ip))
+
+
+###################
+# logs
+###################
+
+class CaaSPLogs(CmdBase):
+
+    prompt = prompt('caaspctl:logs')
+
+    def do_salt(self, line):
+        '''Dump the Salt conatiner logs.'''
+        print_iterator(get_container_logs('salt-master'))
+
+    def do_db(self, line):
+        '''Dump the database conatiner logs.'''
+        print_iterator(get_container_logs('db'))
+
+
+###################
 # zypper
-########################
+###################
 
-zypper_add_repo() {
-  log "Accepting these vendors: $ZYPPER_VENDORS"
+class CaaSPZypper(CmdBase):
 
-  echo "[main]" > /etc/zypp/vendors.d/vendors.conf
-  echo "vendors = $ZYPPER_VENDORS " >> /etc/zypp/vendors.d/vendors.conf
+    prompt = prompt('caaspctl:zypper')
 
-  log_sys "Running zypper add-repo"
-  zypper ar --refresh --no-gpgcheck $@
-  log_sys "... repo added."
-}
+    def do_addrepo(self, line):
+        log.info('Accepting these vendors: {}'.format(ZYPPER_VENDORS))
 
-zypper_remove_repo() {
-  log_sys "Running zypper remove-repo"
-  zypper rr $@
-  log_sys "... repo removed."
-}
+        print_iterator(execute('echo "[main]" > /etc/zypp/vendors.d/vendors.conf'))
+        print_iterator(
+            execute('echo "vendors = {}" >> /etc/zypp/vendors.d/vendors.conf'.format(ZYPPER_VENDORS)))
 
-zypper_update() {
-  log_sys "Diabling the transactional-update timer"
-  systemctl disable --now transactional-update.timer
+        log.info('Running zypper add-repo for "%s"', line)
+        print_iterator(execute('zypper ar --refresh --no-gpgcheck {}'.format(line)))
+        log.info('... repo added.')
 
-  log_sys "Downloading CaaSP updates..."
-  transactional-update cleanup dup salt
-  log "... updates downloads done."
-}
+    def do_removerepo(self, line):
+        log.info('Running zypper remove-repo')
+        print_iterator(execute('zypper rr {}'.format(line)))
+        log.info('... repo removed.')
 
-zypper_install() {
-  log_sys "Installing package(s): $@"
-  transactional-update pkg install $@
-  log_sys "... package installed."
-}
+    def do_update(self, line):
+        log.info('Diabling the transactional-update timer')
+        print_iterator(execute('systemctl disable --now transactional-update.timer'))
 
-zypper_usage() {
-  cat<<EOF
-$(basename $CAASPCTL) zypper subcommands:
+        log.info('Downloading CaaSP updates...')
+        print_iterator(execute('transactional-update cleanup dup'))
+        log.info('... updates downloads done.')
 
-    add-repo|ar [FLAGS]     add a repo
-    remove-repo|rr [FLAGS]  remove a repo
-    update|up               update the system (it does not reboot it)
-    install|in [PACKAGE]    install a local RPM
+    def do_install(self, line):
+        log.info('Installing package(s): %s', line)
+        print_iterator(
+            execute('transactional-update pkg install -y {} {}'.format(ZYPPER_IN_ARGS, line)))
+        log.info('... package installed.')
 
-EOF
-}
+    def do_install_forced(self, line):
+        log.info('Force-installing package(s): %s', line)
+        print_iterator(
+            execute('transactional-update pkg install -y --force {} {}'.format(ZYPPER_IN_ARGS, line)))
+        log.info('... package installed.')
 
-zypper_command() {
-  local command=$1
-  shift
-  case "$command" in
-    add-repo|ar)
-      zypper_add_repo $@
-      ;;
-    remove-repo|rr)
-      zypper_remove_repo $@
-      ;;
-    update|up)
-      zypper_update $@
-      ;;
-    install|in)
-      zypper_install $@
-      ;;
-    help|-h|--help)
-      zypper_usage
-      ;;
-    *)
-      zypper_usage
-      abort "Unknown argument $command"
-      ;;
-  esac
-}
 
-########################
-# activation
-########################
+###################
+# Database
+###################
 
-do_activate() {
-  log_sys "Stopping the kubelet"
-  systemctl stop kubelet
-  log_sys "... done!"
-  sleep 2
+class CaaSPDb(CmdBase):
 
-  log_sys "Stopping all the containers currently running..."
-  docker ps -q | xargs -r docker stop
-  docker ps -q | xargs -r docker kill
-  log_sys "... done!"
-  sleep 2
+    prompt = prompt('caaspctl:db')
 
-  log "Fixing permissions"
-  chmod 755 `find /usr/share/caasp-container-manifests -name '*.sh'`
+    def do_enter(self, line):
+        '''
+        Enter into the database container
+        '''
+        return CmdBase.do_enter(self, 'db')
 
-  log_sys "Running activate.sh"
-  /usr/share/caasp-container-manifests/activate.sh
-  log_sys "... done!"
+    def do_pillar(self, line):
+        log.info('Getting the pillar from the database')
+        print_iterator(exec_sql_in_db(DB_QUERY_PILLAR_CMD, wait=True))
 
-  # TODO: run this iff it has been never run before...
-  #log_sys "Running admin-node-setup.sh"
-  #/usr/share/caasp-container-manifests/admin-node-setup.sh
-  #log_sys "... done!"
+    def do_tables(self, line):
+        log.info('Showing tables in the database')
+        print_iterator(exec_sql_in_db('SHOW TABLES;', wait=True))
 
-  log_sys "Starting kubelet, Salt minion, etc"
-  systemctl start kubelet
-  systemctl start salt-minion
-  log_sys "... done!"
-}
+    def do_minions(self, line):
+        log.info('Getting the list of minions from the database')
+        print_iterator(exec_sql_in_db(DB_QUERY_MINIONS_CMD, wait=True))
 
-########################
-# main
-########################
+    def do_exec(self, line):
+        log.info('Running mariadb command')
+        print_iterator(exec_sql_in_db(line, wait=True))
 
-usage() {
-  cat<<EOF
-$(basename $CAASPCTL) usage: subcommands:
+    def do_wait(self, line):
+        log.info('Waiting for database')
+        wait_for_db()
 
-Salt:
+###################
+# Minions
+###################
 
-    salt               run a Salt command
-    orchestrate|orch   run a Salt orchestration (default: $ORCH_DEFAULT)
-    apply              apply Salt states
-    cmd                run a command in the cluster with the help of "cmd.run"
-    pillar|vars        modoify/query Salt pillars (variables)
-    grains             operate on the Salt grains
-    keys               operate on the Salt keys
 
-Kubernetes/Docker:
+class CaaSPRegistry(CmdBase):
 
-    k8s                kubernetes-specific commands
-    registry|reg       create/manage a local Docker registry
-    exec <CONT> <CMD>  run a command in a container
-    cid <CONT>         get a container ID
-    wait <CONT>        wait for a container
-    enter <CONT>       get a shell in a container
+    prompt = prompt('caaspctl:registry')
 
-    (where <CONT> can be an alias like 'salt-master', 'velum', etc)
+    def default(self, line):
+        log.error('not implemented yet')
 
-CaaSP/MicroOS:
+###################
+# Minions
+###################
 
-    velum              operate on Velum
-    db                 operate on the database
-    activate           run the activation procedure
-    logs               dump logs
 
-OS commands:
+class CaaSPMinions(CmdBase):
 
-    rw|RW              modify the RW status of the filesystem
-    zypper             manage packages, repos, updates...
-    reboot             reboot the machine
+    prompt = prompt('caaspctl:minions')
 
-Misc:
+    def do_db(self, line):
+        log.info('Getting the list of minions from the database')
+        print_iterator(exec_sql_in_db(DB_QUERY_MINIONS_CMD, wait=True))
 
-    help               print this help message
+    def do_ls(self, line):
+        '''
+        List all the minions the Salt master knows about.
+        '''
+        print_iterator(get_salt_keys())
 
-EOF
+    def do_accepted(self, line):
+        '''
+        Print the minions accepted
+        '''
+        log.info('Minions accepted')
+        print_iterator(get_salt_keys_accepted())
 
-  if ls $CAASPCTL-* 1> /dev/null 2>&1; then
-    echo "Other undocumented subcommands (invoke with --help for more details):"
-    echo
-    for i in $CAASPCTL-* ; do
-      echo "   " ${i#$CAASPCTL-}
-    done
-    echo
-  fi
-}
+    def do_num_accepted(self, line):
+        '''
+        Print the number of minions accepted so far.
+        '''
+        log.info('Number of minions accepted')
+        print(get_salt_keys_accepted_num())
 
-[ $# -eq 0 ] && usage && abort "No subcommand provided"
+    def do_accept(self, line):
+        '''
+        Block waiting for (at least) NUM minions to be accepted
 
-command=$1
-shift
-case "$command" in
-  salt)
-    set -f
-    salt_command "$@"
-    ;;
+        Usage:
 
-  velum)
-    velum_command "$@"
-    ;;
+        # block waiting until 6 minions have been accepted
+        > accept 6
+        '''
+        if not line:
+            raise CommandError('must provide a number')
 
-  db)
-    db_command "$@"
-    ;;
+        num = int(line)
 
-  orchestrate|orch)
-    orchestrate_command "$@"
-    ;;
+        log.info('Waiting for (at least) %d minions to be accepted', num)
+        print_iterator(wait_for_num_keys_accepted(num))
+        print_iterator(get_salt_keys_accepted())
 
-  apply)
-    set -f
-    apply_command "$@"
-    ;;
+    def do_rejected(self, line):
+        '''
+        Print the list of minions that have been rejected.
+        '''
+        log.info('Minions rejected')
+        print_iterator(get_salt_keys_rejected())
 
-  cmd)
-    set -f
-    cmd_command "$@"
-    ;;
 
-  pillar|vars)
-    pillar_command "$@"
-    ;;
+###################
+# Orchestrations
+###################
 
-  grains)
-    grains_command "$@"
-    ;;
 
-  keys|key)
-    keys_command "$@"
-    ;;
+class CaaSPEtcHosts(CmdBase):
 
-  exec)
-    exec_in_container "$@"
-    ;;
+    prompt = prompt('caaspctl:etchosts')
 
-  cid)
-    get_cid "$@"
-    ;;
+    def do_add(self, line):
+        '''
+        Add a name and IP in /etc/hosts
 
-  wait)
-    wait_for_container "$@"
-    ;;
+        Usage:
 
-  enter)
-    docker exec -ti $(get_cid $1) /bin/sh
-    ;;
+        > etchosts add master 10.10.0.1
+        '''
+        line_comps = line.split(' ')
+        if len(line_comps) < 2:
+            raise CommandError('insufficient arguments')
 
-  k8s|kubernetes|kube)
-    k8s_command "$@"
-    ;;
+        name = line_comps[0].strip()
+        ip = line_comps[1].strip()
 
-  logs)
-    logs_command "$@"
-    ;;
+        etchosts_add(name, ip)
 
-  zypper)
-    zypper_command "$@"
-    ;;
+    def do_del(self, line):
+        '''
+        Delete a name from /etc/hosts
 
-  rw|RW)
-    rw_command "$@"
-    ;;
+        Usage:
 
-  registry|reg)
-    reg_command "$@"
-    ;;
+        > etchosts del master
+        '''
+        name = line.strip()
 
-  activate)
-    do_activate "$@"
-    ;;
+        etchosts_del(name)
 
-  reboot)
-    do_reboot
-    ;;
+###################
+# Orchestrations
+###################
 
-  help|-h|--help)
-    usage
-    ;;
 
-  *)
-    # extend the usage of caaspctl with other tools (ie, "caaspctl-dns")
-    if [ -e "$CAASPCTL-$command.local" ] ; then
-      sh "$CAASPCTL-$command.local" "$@"
-    elif [ -e "$CAASPCTL-$command" ] ; then
-      sh "$CAASPCTL-$command" "$@"
-    else
-      usage
-      abort "Unknown command $command"
-    fi
-    ;;
-esac
+class CaaSPOrch(CmdBase):
 
-exit 0
+    prompt = prompt('caaspctl:orch')
+
+    def _run_orchestration(self, orch, orch_args='', pillar={}):
+        assert(orch)
+        orchestration = orch or ORCH_DEFAULT
+
+        log.info('Starting the %s orchestration...', orch)
+
+        if pillar:
+            orch_args += ' pillar=\'{}\''.format(json.dumps(pillar, separators=(',', ':')))
+
+        if len(orch_args) > 0:
+            log.info('Orchestration arguments: %s', orch_args)
+
+        print_iterator(salt_sync())
+
+        log.info('Doing %s orchestration for real...', orch)
+        cmd = 'state.orchestrate orch.{orch} {orch_args}'.format(**locals())
+        print_iterator(exec_salt_runner(cmd, salt_args=ORCH_OPTS))
+        log.info('%s orchestration finished', orch)
+
+    def default(self, line):
+        line_comps = line.split(' ')
+        orch = line_comps[0]
+        orch_args = ' '.join(line_comps[1:])
+        self._run_orchestration(orch, orch_args)
+
+    def do_boot(self, line):
+        '''Run the bootstrap orchestration.'''
+        self._run_orchestration(ORCH_DEFAULT, line)
+
+    def do_update(self, line):
+        '''
+        Run the update orchestration.
+        '''
+        self._run_orchestration('update', line)
+
+    def do_update_set_needed(self, line):
+        '''
+        Set the update-is-needed flag in all the machines in the cluster.
+        '''
+        where = get_salt_where_from
+        grain_set(where, UPDATE_GRAIN, 'true')
+
+    def do_rm(self, line):
+        '''
+        Run the removal orchestration, for the node ID provided.
+
+        Usage:
+
+        > orch rm 923ac3ef4a554371b2e247e22ef9b0c8
+        '''
+        if not line:
+            raise CommandError('the removal orchestration needs a node as an argument')
+
+        node_id = line.strip()
+        pillar = {
+            "target": node_id
+        }
+        self._run_orchestration(ORCH_REMOVAL, pillar=pillar)
+
+    def do_add(self, line):
+        '''
+        Run the addition orchestration, for the node(s) ID(s) provided.
+
+        Usage:
+
+        > orch add 923ac3ef4a554371b2e247e22ef9b0c8
+        '''
+        if not line:
+            raise CommandError('the additional orchestration needs a node as an argument')
+
+        node_id = line.strip()
+        pillar = {
+            "target": node_id
+        }
+        self._run_orchestration(ORCH_ADDITION, pillar=pillar)
+
+
+###################
+# Orchestrations
+###################
+
+
+class CaaSPContainers(CmdBase):
+
+    prompt = prompt('caaspctl:cont')
+
+    # specific to caaspctl
+
+    def do_enter(self, line):
+        '''
+        Enter into a container (equivalent to `docker exec -ti CID /bin/sh`)
+
+        Notes:
+
+        * symbolic name can be used for container names (ie, 'db', 'salt-master')
+
+        Usage:
+
+        > enter salt
+        > enter openldap
+        > open db
+        '''
+        if not line:
+            raise CommandError('needs a container name or ID')
+
+        container = line.strip()
+        log.info('Entering %s container', container)
+        enter_container(container)
+        log.info('Leaving %s container', container)
+
+    def do_wait(self, line):
+        '''
+        Wait for a container to be running.
+
+        Notes:
+
+        * symbolic name can be used for container names (ie, 'db', 'salt-master')
+        '''
+        if not line:
+            raise CommandError('needs a container name or ID')
+
+        container = line.strip()
+        log.info('Waiting for %s container', container)
+        wait_for_container(container)
+        log.info('%s container is ready', container)
+
+    def do_cid(self, line):
+        '''
+        The the container ID for a symbolic name (ie, 'db', 'salt-master')
+        '''
+        if not line:
+            raise CommandError('needs a container name')
+
+        name = line.strip()
+        print(get_cid(name))
+
+    def do_exec(self, line):
+        '''
+        Execute a command in a container.
+
+        Notes:
+
+        * symbolic name can be used for container names (ie, 'db', 'salt-master')
+
+        Usage:
+
+        > exec db ls /
+        > exec salt-master salt '*' test.ping
+        '''
+        line_comps = line.split(' ')
+        if len(line_comps) < 2:
+            raise CommandError('insufficient arguments')
+
+        container = line_comps[0].strip()
+        cmd = ' '.join(line_comps[1:])
+
+        log.info('Executing "%s" in container %s', cmd, container)
+        print_iterator(exec_in_container(container, cmd))
+
+###################
+# Main
+###################
+
+
+class CaaSP(CmdBase):
+    """ CaaSP command line """
+
+    prompt = prompt('caaspctl')
+    intro = "CaaSP control tool.\n"
+
+    def __init__(self):
+        CmdBase.__init__(self)
+        self.salt = CaaSPSalt(self)
+        self.pillar = CaaSPPillar(self)
+        self.db = CaaSPDb(self)
+        self.orch = CaaSPOrch(self)
+        self.events = CaaSPEvents(self)
+        self.registry = CaaSPRegistry(self)
+        self.etchosts = CaaSPEtcHosts(self)
+        self.zypper = CaaSPZypper(self)
+        self.minions = CaaSPMinions(self)
+        self.logs = CaaSPLogs(self)
+        self.cont = CaaSPContainers(self)
+
+    def _subcommand(self, sub_cmd, line):
+        if len(line) > 0:
+            sub_cmd.onecmd(line)
+        else:
+            sub_cmd.cmdloop()
+
+    def do_salt(self, line):
+        '''Salt commands.'''
+        self._subcommand(self.salt, line)
+
+    def do_pillar(self, line):
+        '''Salt pillar commands.'''
+        self._subcommand(self.pillar, line)
+
+    def do_db(self, line):
+        '''Database commands.'''
+        self._subcommand(self.db, line)
+
+    def do_registry(self, line):
+        '''Database commands.'''
+        self._subcommand(self.registry, line)
+
+    def do_orch(self, line):
+        '''Orchestration commands.'''
+        self._subcommand(self.orch, line)
+
+    def do_zypper(self, line):
+        '''Zypper commands.'''
+        self._subcommand(self.zypper, line)
+
+    def do_events(self, line):
+        '''Events commands.'''
+        self._subcommand(self.events, line)
+
+    def do_etchosts(self, line):
+        '''/etc/hosts commands.'''
+        self._subcommand(self.etchosts, line)
+
+    def do_minions(self, line):
+        '''Minions commands.'''
+        self._subcommand(self.minions, line)
+
+    def do_logs(self, line):
+        '''Salt commands.'''
+        self._subcommand(self.logs, line)
+
+    def do_cont(self, line):
+        '''Containers commands.'''
+        self._subcommand(self.cont, line)
+
+    #
+    # extra
+    #
+
+    def do_activate(self, line):
+        '''
+        Run the CaaSP activation.
+        '''
+        log.info('Activating VM')
+        try:
+            cmd = SCRIPT_ACTIVATION.format(**locals())
+            print_iterator(execute(cmd))
+        except Exception as e:
+            log.error('command "%s" failed: %s', cmd, e)
+
+    def do_kubeconfig(self, line):
+        '''
+        Generate a Kubeconfig for the current Kubernetes deployment.
+
+        Will raise an exception if the cluster has not been bootstrapp yet.
+        '''
+        log.info('Generating kubeconfig')
+
+        master_ip = get_master_ip()
+        apiserver = "https://{}:6443".format(master_ip)
+        log.info('Will use Kubernetes API at %s', apiserver)
+
+        cert_ca_dir = args.cert_ca_dir
+        cert_admin_dir = args.cert_admin_dir
+        cert_admin_user = args.cert_admin_user
+
+        ca_key = os.path.join(cert_ca_dir, 'private', 'ca.key')
+        ca_crt = os.path.join(cert_ca_dir, 'ca.crt')
+
+        if not os.path.exists(ca_key):
+            raise CommandError('{ca_key} file not found'.format(**locals()))
+        if not os.path.exists(ca_crt):
+            raise CommandError('{ca_crt} file not found'.format(**locals()))
+
+        if not os.path.exists(cert_admin_dir):
+            os.makedirs(cert_admin_dir)
+
+        admin_crt = os.path.join(cert_admin_dir, 'admin.crt')
+        admin_key = os.path.join(cert_admin_dir, 'admin.key')
+        log.info('Will generate %s : %s', admin_crt, admin_key)
+
+        if os.path.exists(admin_crt):
+            os.remove(admin_crt)
+        if os.path.exists(admin_key):
+            os.remove(admin_key)
+
+        try:
+            cmd = SCRIPT_KUBECONFIG.format(**locals())
+            log.debug('using script: %s', cmd)
+            print_iterator(execute(cmd))
+        except Exception as e:
+            log.error('command "%s" failed: %s', cmd, e)
+
+    def do_rw(self, line):
+        '''
+        Enable the rw filesystem
+
+        Usage:
+
+        > rw enable
+        '''
+        if line.lower() in ['yes', 'true', '1', 'enable']:
+            log.info('Making the FS read-writeable')
+            cmd = SCRIP_REMOUNT_RW
+            log.debug('using script: %s', cmd)
+            print_iterator(execute(cmd))
+        else:
+            log.error('unsupported argument "%s"', line)
+
+    def do_high(self, line):
+        '''
+        Shortcut for the 'salt high' command.
+        '''
+        return self.salt.do_high(line)
+
+    def do_apply(self, line):
+        '''
+        Shortcut for the 'salt apply' command.
+        '''
+        return self.salt.do_apply(line)
+
+    def do_reboot(self, line):
+        print_iterator(do_reboot())
+
+    def do_enter(self, line):
+        '''
+        Shortcut for the `cont enter` command.
+        '''
+        return self.cont.do_enter(line)
+
+    def do_wait(self, line):
+        '''
+        Shortcut for the `cont wait` command.
+        '''
+        return self.cont.do_wait(line)
+
+    def do_cid(self, line):
+        '''
+        Shortcut for the `cont cid` command.
+        '''
+        return self.cont.do_cid(line)
+
+    def do_exec(self, line):
+        '''
+        Shortcut for the `cont exec` command.
+        '''
+        return self.cont.do_exec(line)
+
+    def do_version(self, line):
+        '''
+        Print the version.
+        '''
+        print(VERSION)
+        return True
+
+
+#############################################################
+# Main
+#############################################################
+
+if __name__ == '__main__':
+    caasp_cmd = CaaSP()
+
+    if not args.skip_rc_files:
+        caasp_cmd.try_rc_files(CAASPCTL_RC_FILES)
+
+    if len(args.args) > 0 and args.commands_pre:
+        caasp_cmd.command_line_args(args.args)
+
+    if args.script:
+        if args.script_begin:
+            log.info('Will start execution at stage "%s"', args.script_begin)
+            caasp_cmd.blocked = True
+
+        for script in args.script:
+            try:
+                caasp_cmd.load_script(script)
+            except Exception as e:
+                log.critical('Could not read file %s: %s', script, e)
+                sys.exit(1)
+
+        caasp_cmd.blocked = False
+
+        if args.script_only:
+            log.debug('we were running only scripts: exitting...')
+            sys.exit(0)
+
+    if len(args.args) > 0 and not args.commands_pre:
+        caasp_cmd.command_line_args(args.args)
+
+    if not args.args or args.loop:
+        caasp_cmd.cmdloop()
