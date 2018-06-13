@@ -26,7 +26,7 @@ IMG_PURGE=
 UPLOAD_IMG=
 UPLOAD_POOL=
 
-LOCAL_VIRSH="sudo virsh"
+LOCAL_VIRSH="virsh"
 REM_VIRSH="virsh"
 
 WGET="wget"
@@ -35,7 +35,6 @@ RUN_AT=
 
 # ssh options
 SSH_OPTS="-q -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oConnectTimeout=10"
-
 
 while [ $# -gt 0 ] ; do
   case $1 in
@@ -77,6 +76,23 @@ while [ $# -gt 0 ] ; do
       ;;
     --debug)
       set -x
+      ;;
+    --sudo-virsh)
+      case $2 in
+      local)
+        LOCAL_VIRSH="sudo virsh"
+        ;;
+      remote)
+        REM_VIRSH="sudo virsh"
+        ;;
+      both)
+        LOCAL_VIRSH="sudo virsh"
+        REM_VIRSH="sudo virsh"
+        ;;
+      none)
+        ;;
+      esac
+      shift
       ;;
     *)
       echo "Unknown argument $1"
@@ -135,6 +151,8 @@ if [ -n "$RUN_AT" ] ; then
 else
   echo ">>> Using \"$img_down_dir\" as downloads directory"
   mkdir -p "$img_down_dir"
+
+  pushd $(pwd)
   cd "$img_down_dir"
 
   if [ -n "$IMG_REFRESH" ] || ! has_volume "$img_vol_name" ; then
@@ -156,15 +174,16 @@ else
     images | tail -n-2 2>/dev/null | xargs --no-run-if-empty -I{} mv -f {} /tmp/
   fi
 
-  local_image_to_upload=$latest_image
+  local_image_to_upload=$(realpath $latest_image)
+  popd
 fi
 
 
 if [ -n "$UPLOAD_IMG" ] ; then
   [ -n "$UPLOAD_POOL" ] || { echo >&2 "FATAL: pool required. Aborting." ; exit 1 ; }
 
-  echo ">>> Removing previous volume $UPLOAD_IMG"
-  virsh_cmd vol-delete --pool "$UPLOAD_POOL" "$UPLOAD_IMG" || /bin/true
+  echo ">>> Removing previous volume $UPLOAD_IMG (ignoring errors)"
+  virsh_cmd vol-delete --pool "$UPLOAD_POOL" "$UPLOAD_IMG" 2>/dev/null || /bin/true
 
   echo ">>> Creating new volume $UPLOAD_IMG"
   size=$(rem_cmd "stat -c%s $IMG_LOCAL_NAME")

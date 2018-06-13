@@ -1,0 +1,3 @@
+
+print Making sure KSM is enabled
+shell sudo /usr/local/sbin/enable-ksm.sh

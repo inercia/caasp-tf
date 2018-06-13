@@ -1,11 +1,9 @@
-quiet
-devel enable
+devel enable salt=True
 
 print ###############################################
 print # first stage: start with some nodes
 print ###############################################
 
-cluster tfvars no-refresh
 cluster tfvars images-devel
 cluster tfvars tests/addition-stage-1
 

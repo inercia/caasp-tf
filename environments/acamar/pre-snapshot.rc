@@ -1,0 +1,2 @@
+print Temporarily disabling KSM on acamar.arch.suse.de
+shell ssh root@acamar.arch.suse.de '[ -w /sys/kernel/mm/ksm/run ] && echo 0 > /sys/kernel/mm/ksm/run'

@@ -58,11 +58,17 @@ DB_NAME = "velum_production"
 DB_PASSWORD_FILE = '/var/lib/misc/infra-secrets/mariadb-root-password'
 
 # command for inserting in the database, querying, etc...
-DB_INSERT_CMD = 'INSERT INTO pillars (pillar, value) VALUES (\'{key}\', \'{value}\');'
+# - pillar
+DB_INSERT_PILLAR_CMD = \
+    'DELETE FROM pillars WHERE pillar=\'{key}\' AND value=\'{value}\'; ' + \
+    'INSERT INTO pillars (pillar, value) VALUES (\'{key}\', \'{value}\');'
 DB_QUERY_PILLAR_CMD = 'SELECT * FROM pillars;'
 DB_FLUSH_PILLAR_CMD = 'TRUNCATE TABLE pillars;'
+# - minions
 DB_QUERY_MINIONS_CMD = 'SELECT * FROM minions;'
-DB_QUERY_EVENTS = 'SELECT data FROM salt_events ORDER BY alter_time;'
+# - events
+DB_QUERY_EVENTS_CMD = 'SELECT data FROM salt_events ORDER BY alter_time;'
+DB_FLUSH_EVENTS_CMD = 'TRUNCATE TABLE salt_events;'
 
 # vendors accepted by zypper
 ZYPPER_VENDORS = "suse,opensuse,obs://build.suse.de,obs://build.opensuse.org"
@@ -404,6 +410,7 @@ def get_container(name):
 
 
 def get_cid(name):
+    ''' Get the real container for an 'alias' (like 'db' or 'salt') '''
     if name in ['salt-master', 'salt']:
         return get_container(CONTAINER_SALT_MASTER)
     elif name in ['velum']:
@@ -419,8 +426,12 @@ def get_cid(name):
 
 
 def enter_container(name):
+    ''' Enter into the container '''
     cid = get_cid(name)
-    return execute_interactive('docker exec -ti {} /bin/sh'.format(cid))
+    if cid:
+        return execute_interactive('docker exec -ti {} /bin/sh'.format(cid))
+    else:
+        raise Exception('could not find container {}'.format(name))
 
 
 def attach_container(name):
@@ -453,7 +464,7 @@ def wait_for_container(name, timeout=CONTAINER_START_TIMEOUT):
         except:
             pass
 
-        log.debug("Waiting for container {} ({} left)...".format(
+        log.debug('docker: waiting for "{}" ({} left)...'.format(
             name, timeout_limit - datetime.now()))
         time.sleep(5)
 
@@ -461,6 +472,7 @@ def wait_for_container(name, timeout=CONTAINER_START_TIMEOUT):
 
 
 def exec_in_container(name, cmd, wait=False):
+    ''' Run a command in a container '''
     if wait:
         wait_for_container(name)
 
@@ -474,14 +486,14 @@ def exec_in_container(name, cmd, wait=False):
         raise ContainerNotFoundException('could not find container {name}'.format(name=name))
 
     cmd = 'docker exec {} {}'.format(c, cmd)
-    log.debug('Executing in container %s command "%s"', c, cmd)
+    log.debug('docker: executing in "%s" command "%s"', c, cmd)
     for line in execute(cmd):
         if line:
             yield line
 
 
 def restart_container(name):
-    '''Restart a container'''
+    ''' Restart a container '''
     try:
         c = get_cid(name)
     except Exception as e:
@@ -489,8 +501,11 @@ def restart_container(name):
         raise ContainerNotFoundException('could not find container {name}'.format(**locals()))
 
     log.info('Restarting container %s', name)
-    cmd = 'docker restart {c}'.format(**locals())
-    return execute_now(cmd)
+    if c != None:
+        cmd = 'docker restart {c}'.format(**locals())
+        return execute_now(cmd)
+    else:
+        log.warn('docker: nothing to restart: it seems %s was not running', name)
 
 
 #########################
@@ -499,12 +514,14 @@ def restart_container(name):
 
 
 def get_db_password(filename=DB_PASSWORD_FILE):
+    ''' Get the database password '''
     cmd = 'cat ' + filename
     for line in exec_in_container('db', cmd, wait=True):
         return line.strip()  # return only the first line
 
 
 def exec_sql_in_db(cmd, **kwargs):
+    ''' Run a SQL command in the database '''
     password = get_db_password()
     log.debug('Using password %s', password)
     cmd = 'mysql -uroot -p\'{password}\' -B -t -e "{cmd}" {db}'.format(
@@ -514,7 +531,7 @@ def exec_sql_in_db(cmd, **kwargs):
 
 
 def wait_for_db(db=None, timeout=CONTAINER_START_TIMEOUT):
-    ''' Wait for the database to be ready '''
+    ''' Wait for a specific database to be ready '''
     db = db or args.database
     password = get_db_password()
     log.debug('using password %s', password)
@@ -536,8 +553,9 @@ def wait_for_db(db=None, timeout=CONTAINER_START_TIMEOUT):
 
 
 def pillar_db_insert(key, value, **kwargs):
+    ''' Insert a value for a pillar (replacing any previous value) '''
     log.info('Adding pillar "%s"="%s"', key, value)
-    cmd = DB_INSERT_CMD.format(**locals())
+    cmd = DB_INSERT_PILLAR_CMD.format(**locals())
     for line in exec_sql_in_db(cmd, **kwargs):
         yield line
 
@@ -561,6 +579,7 @@ def etchosts_contains(name):
 
 
 def etchosts_add(name, ip):
+    ''' Add an entry in /etc/hosts '''
     if not name:
         raise CommandError("no name provided")
     if not ip:
@@ -578,6 +597,7 @@ def etchosts_add(name, ip):
 
 
 def etchosts_del(name):
+    ''' Remove an entry in /etc/hosts '''
     if not name:
         raise CommandError("no name provided")
 
@@ -593,16 +613,24 @@ def etchosts_del(name):
 
 
 def get_salt_where_from(name):
+    if not name:
+        return '*'
+
     try:
         return {
-            "ca": "G@roles:ca",
-            "admin": "G@roles:admin",
-            "master": "G@roles:kube-master",
-            "masters": "G@roles:kube-master",
-            "minion": "G@roles:kube-minion",
-            "minions": "G@roles:kube-minion",
-            "nodes": "P@roles:kube-(master|minion)",
-            "workers": "P@roles:kube-(master|minion)"
+            '*': '*',
+            'ca': 'G@roles:ca',
+            'admin': 'G@roles:admin',
+            'kube-master': 'G@roles:kube-master',
+            'kube-masters': 'G@roles:kube-master',
+            'master': 'G@roles:kube-master',
+            'masters': 'G@roles:kube-master',
+            'kube-minion': 'G@roles:kube-minion',
+            'kube-minions': 'G@roles:kube-minion',
+            'minion': 'G@roles:kube-minion',
+            'minions': 'G@roles:kube-minion',
+            'nodes': 'P@roles:kube-(master|minion)',
+            'workers': 'P@roles:kube-(master|minion)'
         }[name.lower()]
     except KeyError:
         return name
@@ -720,20 +748,24 @@ def grain_set(where, key, value):
     for line in exec_in_salt(cmd, compound=where, wait=True):
         yield line
 
+def grain_get(where, key):
+    log.info("Getting grain %s in %s", key, where)
+    where = get_salt_where_from(where)
+    cmd = 'grains.get {}'.format(key)
+    for line in exec_in_salt(cmd, compound=where, wait=True):
+        yield line
 
 def grain_ls(where):
     log.info("Listing grains (in '%s')", where)
-    where = get_salt_where_from(where)
     cmd = 'grains.ls'
-    for line in exec_in_salt(cmd, compound=where, wait=True):
+    for line in exec_in_salt(cmd, compound=get_salt_where_from(where), wait=True):
         yield line
 
 
 def grain_items(where):
     log.info("Listing grains (in '%s')", where)
-    where = get_salt_where_from(where)
     cmd = 'grains.items'
-    for line in exec_in_salt(cmd, compound=where, wait=True):
+    for line in exec_in_salt(cmd, compound=get_salt_where_from(where), wait=True):
         yield line
 
 #########################
@@ -741,30 +773,57 @@ def grain_items(where):
 #########################
 
 
-def do_reboot():
+def exec_reboot():
     log.info('Rebooting machine')
     for line in execute('rebootmgrctl reboot'):
         yield line
 
 
-# get ONE OF the masters' IP address
-def get_master_ip():
-    for line in exec_in_salt('network.interface_ip eth0',
-                             compound='G@roles:kube-master',
-                             color=False, wait=True):
-        res = line.strip()  # return only the first line
-        return str(res) if is_ip(res) else None
+def get_role_nodenames(role, timeout=CONTAINER_START_TIMEOUT):
+    ''' Get the nodename for all the nodes with a specific role '''
+    log.debug("get-role-nodenames: getting nodenames for {}...".format(role))
+    timeout_limit = datetime.now() + timedelta(seconds=timeout)
+    while datetime.now() <= timeout_limit:
+        try:
+            for line in grain_get(role, 'nodename'):
+                yield line
+        except Exception as e:
+            log.warning('get-role-nodenames: while waiting for nodename for %s: %s', role, e)
+
+        log.debug("get-role-nodenames: waiting for result for {} ({} left)...".format(
+            role, timeout_limit - datetime.now()))
+        time.sleep(5)
+
+    raise Exception('could not get nodename for {}'.format(role))
 
 
-# get the name of a (random) master
+def get_role_ip(role, timeout=CONTAINER_START_TIMEOUT):
+    ''' Get the IP for a random node with a specific role '''
+    log.debug("get-role-ip: getting IP for {}...".format(role))
+    timeout_limit = datetime.now() + timedelta(seconds=timeout)
+    while datetime.now() <= timeout_limit:
+        try:
+            for line in exec_in_salt('network.interface_ip eth0',
+                                     compound=get_salt_where_from(role.strip()),
+                                     color=False, wait=True):
+                res = line.strip()  # return only the first line
+                if is_ip(res):
+                    log.debug('get-role-ip: obtained IP for %s: %s', role, res)
+                    return str(res)
+        except Exception as e:
+            log.debug('get-role-ip: while waiting for IP for %s: %s', role, e)
+
+        log.debug("get-role-ip: waiting for IP for {} ({} left)...".format(
+            role, timeout_limit - datetime.now()))
+        time.sleep(5)
+
+    raise Exception('could not get IP for {}'.format(role))
 
 
-def get_master_name():
-    for line in exec_in_salt('network.interface_ip eth0',
-                             compound='G@roles:kube-master',
-                             color=False, wait=True):
-        res = line.split(' ')[2]  # return only the first line
-        return str(res) if is_ip(res) else None
+def get_master_ip(timeout=CONTAINER_START_TIMEOUT):
+    ''' Get the IP for a random kubernetes master '''
+    return get_role_ip('kube-master')
+
 
 #########################
 # Output/conversions
@@ -1550,7 +1609,7 @@ class CaaSPEvents(CmdBase):
         (as we get from mysql) or as a regular JSON file.
         '''
         # filter out the things we are not interested in
-        for data in parse_json_from_iter(exec_sql_in_db(DB_QUERY_EVENTS, wait=True)):
+        for data in parse_json_from_iter(exec_sql_in_db(DB_QUERY_EVENTS_CMD, wait=True)):
 
             if filter_jid:
                 if ("jid" in data) and (data["jid"] != filter_jid):
@@ -1642,6 +1701,13 @@ class CaaSPEvents(CmdBase):
         orch_lines = parse_orch_by_node(self._get_filtered_data(**kwargs))
         save_orch_csv(orch_lines)
 
+    def do_flush(self, line):
+        '''
+        Flush the Salt events in the database.
+        '''
+        log.info('Flusing Salt events in the database')
+        print_iterator(exec_sql_in_db(DB_FLUSH_EVENTS_CMD, wait=True))
+
 
 class CaaSPPillar(CmdBase):
 
@@ -1659,7 +1725,7 @@ class CaaSPPillar(CmdBase):
         line_comps = [] if not line else line.split(' ')
 
         if len(line_comps) != 2:
-            raise CommandError('set requires tow arguments: the key and the value')
+            raise CommandError('set requires two arguments: the key and the value')
 
         key, value = line_comps[0].strip(), line_comps[1].strip()
         log.info('Setting the %s to %s', key, value)
@@ -1764,12 +1830,16 @@ class CaaSPPillar(CmdBase):
         wait_for_db()
 
         admin_ip = default_iface_ip()
+        if not admin_ip:
+            raise CommandError('could not get admin IP')
         assert(is_ip(admin_ip))
         log.debug('using dashboard at %s', admin_ip)
         print_iterator(pillar_db_insert('dashboard', admin_ip))
         print_iterator(pillar_db_insert('dashboard_external_fqdn', admin_ip))
 
         master_ip = get_master_ip()
+        if not master_ip:
+            raise CommandError('could not get master IP')
         assert(is_ip(master_ip))
         log.debug('using master at %s', master_ip)
         print_iterator(pillar_db_insert('api:server:external_fqdn', master_ip))
@@ -1941,6 +2011,19 @@ class CaaSPMinions(CmdBase):
         log.info('Minions rejected')
         print_iterator(get_salt_keys_rejected())
 
+    def do_masters(self, line):
+        '''
+        Print the list of nodes where the kube-master role has been assigned
+        '''
+        log.info('Masters:')
+        print_iterator(get_role_nodenames('masters'))
+
+    def do_minions(self, line):
+        '''
+        Print the list of nodes where the kube-minion role has been assigned
+        '''
+        log.info('Minions:')
+        print_iterator(get_role_nodenames('minions'))
 
 ###################
 # Orchestrations
@@ -1985,6 +2068,10 @@ class CaaSPEtcHosts(CmdBase):
 ###################
 
 
+class OrchestrationFailure(Exception):
+    pass
+
+
 class CaaSPOrch(CmdBase):
 
     prompt = prompt('caaspctl:orch')
@@ -1993,20 +2080,25 @@ class CaaSPOrch(CmdBase):
         assert(orch)
         orchestration = orch or ORCH_DEFAULT
 
-        log.info('Starting the %s orchestration...', orch)
+        log.info('orchestration: starting "%s"...', orch)
 
         if pillar:
             orch_args += ' pillar=\'{}\''.format(json.dumps(pillar, separators=(',', ':')))
 
         if len(orch_args) > 0:
-            log.info('Orchestration arguments: %s', orch_args)
+            log.info('orchestration: arguments: %s', orch_args)
 
         print_iterator(salt_sync())
 
-        log.info('Doing %s orchestration for real...', orch)
+        log.info('orchestration: doing %s for real...', orch)
         cmd = 'state.orchestrate orch.{orch} {orch_args}'.format(**locals())
-        print_iterator(exec_salt_runner(cmd, salt_args=ORCH_OPTS))
-        log.info('%s orchestration finished', orch)
+        try:
+            for line in exec_salt_runner(cmd, salt_args=ORCH_OPTS):
+                sys.stdout.write(line)
+        except Exception as e:
+            raise OrchestrationFailure('orchestration {} failed: {}'.format(orch, e))
+        else:
+            log.info('orchestration: %s finished', orch)
 
     def default(self, line):
         line_comps = line.split(' ')
@@ -2028,8 +2120,7 @@ class CaaSPOrch(CmdBase):
         '''
         Set the update-is-needed flag in all the machines in the cluster.
         '''
-        where = get_salt_where_from
-        grain_set(where, UPDATE_GRAIN, 'true')
+        grain_set(line, UPDATE_GRAIN, 'true')
 
     def do_rm(self, line):
         '''
@@ -2087,9 +2178,8 @@ class CaaSPContainers(CmdBase):
 
         Usage:
 
-        > enter salt
-        > enter openldap
-        > open db
+        > cont enter salt
+        > cont enter openldap
         '''
         if not line:
             raise CommandError('needs a container name or ID')
@@ -2106,6 +2196,10 @@ class CaaSPContainers(CmdBase):
         Notes:
 
         * symbolic name can be used for container names (ie, 'db', 'salt-master')
+
+        Usage:
+
+        > cont wait db
         '''
         if not line:
             raise CommandError('needs a container name or ID')
@@ -2135,8 +2229,8 @@ class CaaSPContainers(CmdBase):
 
         Usage:
 
-        > exec db ls /
-        > exec salt-master salt '*' test.ping
+        > cont exec db ls /
+        > cont exec salt-master salt '*' test.ping
         '''
         line_comps = line.split(' ')
         if len(line_comps) < 2:
@@ -2147,6 +2241,44 @@ class CaaSPContainers(CmdBase):
 
         log.info('Executing "%s" in container %s', cmd, container)
         print_iterator(exec_in_container(container, cmd))
+
+    def do_logs(self, line):
+        '''
+        Get the logs for a container.
+
+        Notes:
+
+        * symbolic name can be used for container names (ie, 'db', 'salt-master')
+
+        Usage:
+
+        > cont logs ldap
+        '''
+        if not line:
+            raise CommandError('container not provided')
+
+        container = line.strip()
+
+        log.info('Dumping logs for "%s"', container)
+        cid = get_cid(container)
+        if not cid:
+            log.warning('could not find container %s', container)
+        else:
+            print_iterator(execute('docker logs ' + cid))
+
+    def do_restart(self, line):
+        '''
+        Restart a container (ie, 'db', 'salt-master')
+
+        Usage:
+
+        > cont restart ldap
+        '''
+        if not line:
+            raise CommandError('needs a container name')
+
+        name = line.strip()
+        restart_container(name)
 
 ###################
 # Main
@@ -2310,7 +2442,7 @@ class CaaSP(CmdBase):
         return self.salt.do_apply(line)
 
     def do_reboot(self, line):
-        print_iterator(do_reboot())
+        print_iterator(exec_reboot())
 
     def do_enter(self, line):
         '''

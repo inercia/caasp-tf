@@ -1,0 +1,7 @@
+###
+### this file will be loaded after a 'cluster destroy' when using --env=acamar
+###
+
+### stop the local interface created in the pre-create script
+###
+shell support/network/ssh-tunnel.sh --stop --sudo -i ~/.ssh/alvaro@suse --tap --tap-rbridge virbr3 acamar.arch.suse.de

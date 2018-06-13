@@ -52,7 +52,7 @@ variable "roles" {
     "0" = "kube-master"
   }
 
-  description = "some special roles for some specific VMs"
+  description = "comma-separated list of roles for specific VMs"
 }
 
 # some behaviors...
@@ -127,6 +127,7 @@ resource "null_resource" "copy_manifests" {
     inline = [
       "/tmp/caasp/caaspctl rw enable",
       "rm -rf /usr/share/caasp-container-manifests",
+      "echo Will copy ${pathexpand(var.manifests_dir)}",
     ]
   }
 
@@ -137,7 +138,7 @@ resource "null_resource" "copy_manifests" {
 
   provisioner "remote-exec" {
     inline = [
-      "chmod 755 usr/share/caasp-container-manifests/*.sh",
+      "chmod 755 /usr/share/caasp-container-manifests/*.sh",
       "sh /usr/share/caasp-container-manifests/admin-node-setup.sh",
     ]
   }
@@ -256,10 +257,10 @@ resource "null_resource" "copy_salt" {
 
 data "template_file" "role_grain" {
   count    = "${var.nodes_count}"
-  template = "roles:\n- $${role}"
+  template = "roles: [ $${roles} ]"
 
   vars {
-    role = "${lookup(var.roles, count.index, var.default_role)}"
+    roles = "${lookup(var.roles, count.index, var.default_role)}"
   }
 }
 
@@ -398,6 +399,7 @@ resource "null_resource" "activate" {
     "null_resource.copy_manifests",
     "null_resource.copy_salt",
     "null_resource.copy_resources_admin",
+    "null_resource.autorun_admin",
   ]
 
   connection {

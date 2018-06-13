@@ -1,6 +1,7 @@
 devel enable salt=True, manifests=True
 
-cluster tfvars images-devel
+cluster tfvars images-2.1
+cluster tfvars tests/update-2.0-to-master
 
 stage apply
 print ###############################################
@@ -20,21 +21,33 @@ sleep 30
 
 stage orch
 print ###############################################
-print # bootstrapping
+print # bootstrapping in 2.0
 print ###############################################
 cluster rollback
-
-# make sure the salt-minion is up and running
-ssh nodes "systemctl restart salt-minion"
 
 # check nodes->dashboard connectivity before going further
 # (this will abort the script if it fails)
 ssh nodes "ping -c1 dashboard"
 
 # run the regular bootstrap orchestration
+devel branch salt release-2.0
+devel branch manifests release-2.0
 salt wait
 orch boot
 sleep 30
 
-cluster snapshot stage="post-orch", description="Orchestration has been run"
+cluster snapshot stage="post-orch-2.0", description="Orchestration 2.0 has been run. Update to MASTER will be done now."
+sleep 30
+
+stage update
+print ###############################################
+print # updating the cluster to current worktree
+print ###############################################
+cluster rollback
+
+# run an update
+devel branch salt RESET
+devel branch manifests RESET
+salt wait
+orch update fake=True
 sleep 30

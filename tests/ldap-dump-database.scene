@@ -1,0 +1,65 @@
+devel enable salt=True, manifests=True
+
+cluster tfvars images-devel
+
+stage apply
+print ###############################################
+print # creating cluster
+print ###############################################
+
+cluster create
+sleep 30
+
+# wait for nodes to be accepted
+salt wait
+ctl minions accepted
+sleep 30
+
+cluster snapshot stage="post-create"
+sleep 30
+
+###########################################
+# copies
+###########################################
+stage copies
+cluster rollback
+
+devel enable salt=True, manifests=True
+
+cluster rollback
+copy admin skip_reboot=True
+
+### NOTE: this will only work if the manifests
+###       mount entrypoint.sh in /usr/local/bin/entrypoint.sh
+copy to admin ../container-images/openldap-image/root/usr/local/bin/entrypoint.sh /usr/share/caasp-container-manifests/config/ldap/
+ssh admin ls -lisa /usr/share/caasp-container-manifests/config/ldap/
+
+### Remove the configuration, so we force the reconfiguration
+ssh admin rm -rf /var/lib/misc/ldap/*  /var/lib/misc/ldap-config/*
+
+cluster reboot admin wait_for=salt
+sleep 5
+
+stage orch
+###############################################
+# bootstrapping
+###############################################
+
+# run the regular bootstrap orchestration
+salt wait
+orch boot
+sleep 30
+
+cluster snapshot stage="post-orch", description="Orchestration has been run"
+sleep 30
+
+# sleep 5
+#
+# print Checking ldap logs
+# ctl cont logs ldap
+#
+# print This should NOT DUMP passwords
+# ctl cont exec ldap ldapsearch -v -v -x -Z -b dc=infra,dc=caasp,dc=local -s sub
+#
+# print Trying to get the test@test.com info
+# ctl cont exec ldap ldapsearch -v -x -Z -w test12345 -D mail=test@test.com,ou=People,dc=infra,dc=caasp,dc=local -h 127.0.0.1

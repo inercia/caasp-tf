@@ -1,11 +1,12 @@
 print ##################################################
 print # test that we can
-print # 1. remove a node
-print # 2. remove a node when some other node is down
+print # 1. remove a master
+print # 2. add a master
 print ##################################################
 
 devel enable salt=True
-cluster tfvars tests/removal
+
+cluster tfvars tests/removal-addition
 
 stage apply
 print ###############################################
@@ -46,14 +47,14 @@ sleep 30
 #ssh node-1 "set -a ; source /etc/sysconfig/etcdctl ; set +a ; etcdctl cluster-health"
 ssh node-1 "kubectl get nodes"
 
-cluster snapshot stage="post-orch", description="Orchestration has been run"
-sleep 30
+#  cluster snapshot stage="post-orch", description="Orchestration has been run"
+#  sleep 30
 
 stage orch-rm
 print ###############################################
-print # first test: regular removal
+print # removing master caasp-node-1
 print ###############################################
-cluster rollback
+#  cluster rollback
 sleep 30
 
 orch rm caasp-node-1
@@ -69,23 +70,25 @@ test cmd_at node-0 kubectl get nodes
 print "Checking nodes see >=3 nodes alive"
 test cmd_at node-0 [ \$(kubectl get nodes | grep caasp-node | grep -v NotReady | wc -l) -ge 3 ]
 
-# print "Test that a node has been rejected"
-# test cmd_at admin "caaspctl minions rejected | grep {% get_machine_id('caasp-node-1') %}"
+#  TODO: check we can see 2 masters
+#  TODO: check caasp-node-1 is not there
 
-stage orch-rm-minion-down
+cluster snapshot stage="post-rm", description="caasp-node-1 has been removed from the cluster"
+sleep 30
+
+stage orch-add
 print ###############################################
-print # second test: removal with a node down
+print # adding master caasp-node-6
 print ###############################################
 cluster rollback
 sleep 30
 
-ssh run caasp-node-1 systemctl stop salt-minion
-orch rm caasp-node-2
-sleep 30
-ssh run caasp-node-1 systemctl start salt-minion
+print "Setting node-6 as a master"
+ssh run caasp-node-6 echo -e 'roles: [ kube-master ]' > /etc/salt/grains
 
-# check if the kubectl is fine
-# orch kubeconfig
+# caasp-node-6 should be accepted, so a orch boot should setup the new node
+orch boot
+sleep 30
 
 stage test2-tests
 print "Checking nodes can get the list of nodes"
@@ -94,5 +97,6 @@ test cmd_at node-0 kubectl get nodes
 print "Checking nodes see >=3 nodes alive"
 test cmd_at node-0 [ \$(kubectl get nodes | grep caasp-node | grep -v NotReady | wc -l) -ge 3 ]
 
-# print "Test that node-2 key has been rejected"
-# test cmd_at admin "caaspctl minions rejected | grep {% get_machine_id('caasp-node-2') %}"
+#  TODO: check we can see 3 masters
+#  TODO: check caasp-node-6 is there
+#  TODO: check caasp-node-1 is not there

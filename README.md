@@ -74,13 +74,31 @@ a snapshot of the VMs
 ./caasp @node-1 cat /etc/hosts
 ```
 
+* Create a cluster with 6 nodes, create a snapshot,
+bootstrap the cluster, create a new snapshot and then
+remove `node-2`
+
+```
+./caasp \
+  'cluster tfvar num_nodes=6 ; cluster create ; cluster snapshot ; orch boot ; cluster snapshot ; orch rm node-2'
+```
+
 ## First steps
 
-* Run `./caasp cluster create` for creating the VMs in the _localhost_.
-* Then run the bootstrap orchestration with `./caasp orch boot`.
-* Finally, you can get a valid kubeconfig file with `./caasp orch kubeconfig`
+  * Run `./caasp cluster create` for creating a default cluster
+in the _localhost_.
+  * Then run the bootstrap orchestration with `./caasp orch boot`.
+  * Finally, you can get a valid kubeconfig file
+with `./caasp orch kubeconfig`
 
-You can also ssh to any machine with `./caasp ssh <name>`.
+You can get a _command line loop_ by just running ``./caasp`, where you
+can get some help on commands with `help <cmd>` (or just `? <cmd>`).
+
+You can also:
+
+  * ssh to any machine with `./caasp ssh <name>` (or the shortcut `@<name>` in the loop)
+  * run local commands with `./caasp shell <cmd>`  (or the shortcut `! <cmd>` in the loop)
+
 
 ## Development mode
 

@@ -56,6 +56,11 @@ variable "img_down_extra_args" {
   description = "Extra arguments for the images downloader"
 }
 
+variable "img_sudo_virsh" {
+  default     = "local"
+  description = "Run virsh wioth sudo on [local|remote|both]"
+}
+
 variable "nodes_count" {
   default     = 2
   description = "Number of non-admin nodes to be created"
@@ -115,7 +120,7 @@ resource "null_resource" "download_caasp_image" {
   count = "${length(var.img_url_base) == 0 ? 0 : 1}"
 
   provisioner "local-exec" {
-    command = "./support/tf/download-image.sh --src-base ${var.img_url_base} --refresh ${var.img_refresh} --local ${var.img} --upload-to-img ${var.prefix}_base_${basename(var.img)} --upload-to-pool ${var.img_pool} ${var.img_down_extra_args}"
+    command = "./support/tf/download-image.sh --sudo-virsh ${var.img_sudo_virsh} --src-base ${var.img_url_base} --refresh ${var.img_refresh} --local ${var.img} --upload-to-img ${var.prefix}_base_${basename(var.img)} --upload-to-pool ${var.img_pool} ${var.img_down_extra_args}"
   }
 }
 
