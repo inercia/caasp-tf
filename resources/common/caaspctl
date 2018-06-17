@@ -3,6 +3,7 @@
 import argparse
 import glob as gb
 import json
+import csv
 import logging
 import os
 import os.path as op
@@ -16,6 +17,13 @@ import time
 import traceback
 from cmd import Cmd
 from datetime import datetime, timedelta
+
+try:
+    # for Python 2.x
+    from StringIO import StringIO
+except ImportError:
+    # for Python 3.x
+    from io import StringIO
 
 import yaml
 
@@ -104,9 +112,9 @@ SCRIPT_KUBECONFIG = '''
   kubectl config use-context default-system
 '''
 
-# command for remouonting the filesystem in read-write mode
+# command for remounting the filesystem in read-write mode
 SCRIP_REMOUNT_RW = '''
-btrfs property set -ts /.snapshots/1/snapshot ro false
+btrfs property set -ts /.snapshots/{num}/snapshot ro false
 mount -o remount,rw /
 '''
 
@@ -1871,13 +1879,18 @@ class CaaSPZypper(CmdBase):
     prompt = prompt('caaspctl:zypper')
 
     def do_addrepo(self, line):
+        '''
+        Add a repository
+
+        Usage:
+
+        > zypper addrepo --enable --refresh http://something/updates myrepo
+        '''
         log.info('Accepting these vendors: {}'.format(ZYPPER_VENDORS))
-
         print_iterator(execute('echo "[main]" > /etc/zypp/vendors.d/vendors.conf'))
-        print_iterator(
-            execute('echo "vendors = {}" >> /etc/zypp/vendors.d/vendors.conf'.format(ZYPPER_VENDORS)))
+        print_iterator(execute('echo "vendors = {}" >> /etc/zypp/vendors.d/vendors.conf'.format(ZYPPER_VENDORS)))
 
-        log.info('Running zypper add-repo for "%s"', line)
+        log.info('Running zypper add-repo %s', line)
         print_iterator(execute('zypper ar --refresh --no-gpgcheck {}'.format(line)))
         log.info('... repo added.')
 
@@ -1887,12 +1900,8 @@ class CaaSPZypper(CmdBase):
         log.info('... repo removed.')
 
     def do_update(self, line):
-        log.info('Diabling the transactional-update timer')
-        print_iterator(execute('systemctl disable --now transactional-update.timer'))
-
-        log.info('Downloading CaaSP updates...')
-        print_iterator(execute('transactional-update cleanup dup'))
-        log.info('... updates downloads done.')
+        log.info('Running "transactional-update" with "systemctl"')
+        print_iterator(execute('systemctl start transactional-update'))
 
     def do_install(self, line):
         log.info('Installing package(s): %s', line)
@@ -2421,9 +2430,29 @@ class CaaSP(CmdBase):
 
         > rw enable
         '''
-        if line.lower() in ['yes', 'true', '1', 'enable']:
-            log.info('Making the FS read-writeable')
-            cmd = SCRIP_REMOUNT_RW
+        if line.strip().lower() in ['yes', 'true', '1', 'enable']:
+            snapshots = list(execute('snapper list'))
+            # will result in something like:
+            #
+            # Type   | # | Pre # | Date                             | User | Cleanup | Description           | Userdata
+            # -------+---+-------+----------------------------------+------+---------+-----------------------+--------------
+            # single | 0 |       |                                  | root |         | current               |
+            # single | 1 |       | Wed 08 Nov 2017 09:19:52 PM CET  | root |         | first root filesystem |
+            # single | 2 |       | Sun 10 Jun 2018 08:38:45 PM CEST | root | number  | Snapshot Update       | important=yes
+            # [...]
+            # single | 7 |       | Thu 14 Jun 2018 12:03:42 PM CEST | root | number  | Snapshot Update       | important=yes
+            # single | 8 |       | Fri 15 Jun 2018 04:36:48 PM CEST | root |         | Snapshot Update       |
+            # single | 9 |       | Fri 15 Jun 2018 05:03:42 PM CEST | root |         | Snapshot Update       |
+            #
+            scsv = '\n'.join(snapshots[2:])  # create a string, but skip the first two lines
+            f = StringIO(scsv)
+            snapshots_rows = list(csv.reader(f, delimiter='|'))
+
+            # take the second field (the snapshot num) of the last snapshot
+            last_snapshot_num = int(snapshots_rows[-1][1])
+
+            log.info('Making the FS read-writeable (with snapshot=%d)', last_snapshot_num)
+            cmd = SCRIP_REMOUNT_RW.format(num=last_snapshot_num)
             log.debug('using script: %s', cmd)
             print_iterator(execute(cmd))
         else:

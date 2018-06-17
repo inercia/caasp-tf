@@ -22,8 +22,8 @@ shell ssh acamar.arch.suse.de '/sbin/ifconfig virbr3'
 print Check/recreate tap5 <-> virbr3 @ acamar.arch.suse.de
 shell support/network/ssh-tunnel.sh --sudo -i ~/.ssh/alvaro@suse --tap --tap-rbridge virbr3 acamar.arch.suse.de
 
-print Try to enable KSM on acamar.arch.suse.de
-shell ssh root@acamar.arch.suse.de '[ -w /sys/kernel/mm/ksm/merge_across_nodes ] && echo 0 > /sys/kernel/mm/ksm/merge_across_nodes'
-shell ssh root@acamar.arch.suse.de '[ -w /sys/kernel/mm/ksm/run ] && echo 1 > /sys/kernel/mm/ksm/run'
-shell ssh root@acamar.arch.suse.de '[ -w /sys/kernel/mm/ksm/pages_to_scan ] && echo $(($(lscpu -p | grep -vc "^#")*64)) > /sys/kernel/mm/ksm/pages_to_scan'
-shell ssh root@acamar.arch.suse.de '[ -w /sys/kernel/mm/transparent_hugepage/enabled ] && echo never > /sys/kernel/mm/transparent_hugepage/enabled'
+# print Try to enable KSM on acamar.arch.suse.de
+# shell ssh root@acamar.arch.suse.de '[ -w /sys/kernel/mm/ksm/merge_across_nodes ] && echo 0 > /sys/kernel/mm/ksm/merge_across_nodes'
+# shell ssh root@acamar.arch.suse.de '[ -w /sys/kernel/mm/ksm/run ] && echo 1 > /sys/kernel/mm/ksm/run'
+# shell ssh root@acamar.arch.suse.de '[ -w /sys/kernel/mm/ksm/pages_to_scan ] && echo $(($(lscpu -p | grep -vc "^#")*64)) > /sys/kernel/mm/ksm/pages_to_scan'
+# shell ssh root@acamar.arch.suse.de '[ -w /sys/kernel/mm/transparent_hugepage/enabled ] && echo never > /sys/kernel/mm/transparent_hugepage/enabled'

@@ -1,0 +1,98 @@
+
+cluster tfvars images-2.1
+cluster tfvars tests/update-2.1-to-master
+
+stage apply
+print ###############################################
+print # creating cluster
+print ###############################################
+
+cluster create
+sleep 30
+
+# wait for nodes to be accepted
+salt wait
+ctl minions accepted
+sleep 30
+
+cluster snapshot stage="post-create"
+sleep 30
+
+stage orch
+print ###############################################
+print # bootstrapping in 2.1
+print ###############################################
+cluster rollback
+
+print checking nodes->dashboard connectivity before going further
+ssh nodes "ping -c1 dashboard"
+
+print Disabling transactional-update in the cluster
+ssh all systemctl disable transactional-update
+
+print running the regular bootstrap orchestration
+devel branch salt release-2.1
+salt wait
+orch boot
+sleep 30
+
+cluster snapshot stage="post-orch-2.1", description="Orchestration 2.1 has been run. Update to MASTER will be done now."
+sleep 30
+
+stage update-admin
+print ###############################################
+print # updating the Admin node to 3.0
+print ###############################################
+cluster rollback
+
+# NOTE: `transactional-update` must have been run BEFORE the
+#       filesystem is made rw: the updates snapshot
+#       will not be created after doing the `rw enable`.
+#       So we should have the `tx_update_reboot_needed`
+#       set in the nodes at this point...
+
+print checking nodes have the must-be-rebooted flag set
+ssh nodes grep tx_update_reboot_needed /etc/salt/grains
+
+print rebooting the Admin into 3.0
+cluster reboot admin
+sleep 15
+
+# for some unknown reason, kubelet is not started
+ssh wait admin
+ssh admin systemctl start kubelet
+salt wait
+sleep 60
+salt wait
+
+print checking the Admin is running 3.0
+ssh admin rpm -qa | grep caasp-release
+
+print sync all
+ctl salt sync all
+
+sleep 30
+
+print deploying some workload: an nginx with 10 replicas
+copy to node-1 tests/update-2.1-to-master.yml
+print checking the status of the nginx-deployment
+ssh node-1 kubectl apply -f update-2.1-to-master.yml
+sleep 120
+print checking the status of the nginx-deployment again
+ssh node-1 kubectl describe deployment nginx-deployment
+
+sleep 30
+cluster snapshot stage="post-os-updates", description="Updates have been installed and tx_reboot_needed is set."
+
+stage update-cluster
+print ###############################################
+print # running Salt update for the cluster
+print ###############################################
+cluster rollback
+
+print running the Salt update
+devel enable salt=True
+devel branch salt reset
+salt wait
+orch update
+sleep 30

@@ -6,6 +6,7 @@ print ##################################################
 
 devel enable salt=True
 
+cluster tfvars images-devel
 cluster tfvars tests/removal-addition
 
 stage apply

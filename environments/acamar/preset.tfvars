@@ -29,11 +29,9 @@ libvirt_uri = "qemu+ssh://root@acamar.arch.suse.de/system"
 
 prefix = "alvaro-caasp"
 
-img_src_filename = "SUSE-CaaS-Platform-4.0-for-KVM-and-Xen.x86_64.qcow2"
-
 ### this specifies that the "download-image" must do
 ### the "wget" in acamar, not here
-img_down_extra_args = "--run-at root@acamar.arch.suse.de --src-filename SUSE-CaaS-Platform-4.0-for-KVM-and-Xen.x86_64.qcow2"
+img_down_extra_args = "--run-at root@acamar.arch.suse.de"
 
 ### we will download the image to "/tmp" and then import
 ### it into the "default" pool

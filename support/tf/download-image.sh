@@ -20,7 +20,7 @@ IMG_SRC_BASE="http://download.suse.de/install/SUSE-CaaSP-1.0-Beta3/"
 IMG_SRC_FILENAME=
 IMG_REGEX="SUSE-CaaS-Platform.*-KVM-and-Xen.*x86_64.*Build"
 IMG_GLOB=$(echo "$IMG_REGEX" | sed -e 's|\.\*|\*|g')*.qcow2
-IMG_LOCAL_NAME="images/beta/caasp.qcow2"
+IMG_LOCAL_NAME="images/devel/caasp.qcow2"
 IMG_REFRESH=1
 IMG_PURGE=
 UPLOAD_IMG=
@@ -35,6 +35,9 @@ RUN_AT=
 
 # ssh options
 SSH_OPTS="-q -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oConnectTimeout=10"
+
+log()   { echo >&2 "### $@ " ;  }
+abort() { echo >&2 "!!! FATAL: $@. Aborting." ; exit 1 ; }
 
 while [ $# -gt 0 ] ; do
   case $1 in
@@ -115,8 +118,7 @@ WGET_REC_OPTS="-r \
                --accept=*.qcow2 \
                --accept-regex=$IMG_REGEX"
 
-img_vol_name=$(basename "$IMG_LOCAL_NAME")
-img_down_dir=$(dirname "$IMG_LOCAL_NAME")
+[ -n "$IMG_LOCAL_NAME" ] || IMG_LOCAL_NAME=$(mktemp /tmp/caasp-image.XXXXXX)
 
 images() {
   ls -1 -t $IMG_GLOB 2>/dev/null
@@ -142,72 +144,68 @@ virsh_cmd() {
   fi
 }
 
-if [ -n "$RUN_AT" ] ; then
-  [ -n "$IMG_SRC_FILENAME" ] || { echo >&2 "FATAL: filename required. Aborting." ; exit 1 ; }
+############################################
 
-  echo ">>> Downloading at $RUN_AT"
-  rem_cmd "$WGET --progress=dot -O '$IMG_LOCAL_NAME' '$IMG_SRC_BASE/$IMG_SRC_FILENAME'"
-  local_image_to_upload=$IMG_LOCAL_NAME
+if [ -n "$RUN_AT" ] ; then
+  [ -n "$IMG_SRC_FILENAME" ] || abort "--src-filename required when using --run-at"
+
+  log "Downloading at $RUN_AT"
+  IMG_LOCAL_NAME=$(rem_cmd mktemp /tmp/caasp-image.XXXXXX)
+  log "... ignoring --local argument: will download to $IMG_LOCAL_NAME"
+  rem_cmd "$WGET --no-verbose -O '$IMG_LOCAL_NAME' '$IMG_SRC_BASE/$IMG_SRC_FILENAME'"
 else
-  echo ">>> Using \"$img_down_dir\" as downloads directory"
-  mkdir -p "$img_down_dir"
+  IMG_LOCAL_BASENAME=$(basename "$IMG_LOCAL_NAME")
+  IMG_LOCAL_DIRNAME=$(dirname "$IMG_LOCAL_NAME")
+
+  log "Using \"$IMG_LOCAL_DIRNAME\" as local directory for downloads"
+  mkdir -p "$IMG_LOCAL_DIRNAME"
 
   pushd $(pwd)
-  cd "$img_down_dir"
+  cd "$IMG_LOCAL_DIRNAME"
 
-  if [ -n "$IMG_REFRESH" ] || ! has_volume "$img_vol_name" ; then
-    echo ">>> Downloading the latest image for importing as $img_vol_name"
-    hash $WGET 2>/dev/null || { echo >&2 "FATAL: wget required. Aborting." ; exit 1 ; }
+  if [ -n "$IMG_REFRESH" ] || ! has_volume "$IMG_LOCAL_BASENAME" ; then
+    log "Downloading the latest image for importing as $IMG_LOCAL_BASENAME"
+    hash $WGET 2>/dev/null || abort "wget required"
     $WGET $WGET_OPTS $WGET_REC_OPTS $IMG_SRC_BASE
-    [ $? -eq 0 ] || { echo >&2 "FATAL: download failed. Aborting." ; exit 1 ; }
+    [ $? -eq 0 ] || abort "download failed"
   fi
 
   latest_image="$(images | head -n1 2>/dev/null)"
-  [ -n "$latest_image" ] || { echo >&2 "FATAL: could not determine the latest image (with glob $IMG_GLOB). Aborting." ; exit 1 ; }
+  [ -n "$latest_image" ] || abort "could not determine the latest image (with glob $IMG_GLOB)"
 
-  echo ">>> Latest image: $img_vol_name -> $latest_image"
-  rm -f "$img_vol_name"
-  ln -sf "$latest_image" "$img_vol_name"
+  log "Latest image: $IMG_LOCAL_BASENAME -> $latest_image"
+  rm -f "$IMG_LOCAL_BASENAME"
+  ln -sf "$latest_image" "$IMG_LOCAL_BASENAME"
 
   if [ -n "$IMG_PURGE" ] ; then
-    echo ">>> Moving previous downloads to /tmp"
+    log "Moving previous downloads to /tmp"
     images | tail -n-2 2>/dev/null | xargs --no-run-if-empty -I{} mv -f {} /tmp/
   fi
 
-  local_image_to_upload=$(realpath $latest_image)
+  IMG_LOCAL_NAME=$(realpath $latest_image)
   popd
 fi
 
-
 if [ -n "$UPLOAD_IMG" ] ; then
-  [ -n "$UPLOAD_POOL" ] || { echo >&2 "FATAL: pool required. Aborting." ; exit 1 ; }
+  [ -n "$UPLOAD_POOL" ] || abort "--pool required"
 
-  echo ">>> Removing previous volume $UPLOAD_IMG (ignoring errors)"
+  log "Removing previous volume $UPLOAD_IMG (ignoring errors)"
   virsh_cmd vol-delete --pool "$UPLOAD_POOL" "$UPLOAD_IMG" 2>/dev/null || /bin/true
 
-  echo ">>> Creating new volume $UPLOAD_IMG"
+  log "Creating new volume $UPLOAD_IMG"
   size=$(rem_cmd "stat -c%s $IMG_LOCAL_NAME")
-  if [ $? -ne 0 ] ; then
-    echo >&2 "FATAL: could not get file size for $IMG_LOCAL_NAME."
-    exit 1
-  fi
+  [ $? -ne 0 ] && abort "could not get file size for $IMG_LOCAL_NAME."
 
-  virsh_cmd vol-create-as "$UPLOAD_POOL" "$UPLOAD_IMG" $size --format raw
-  if [ $? -ne 0 ] ; then
-    echo >&2 "FATAL: could not create volume $UPLOAD_IMG. Aborting."
-    exit 1
-  fi
+  virsh_cmd vol-create-as "$UPLOAD_POOL" "$UPLOAD_IMG" $size --format raw || \
+    abort "could not create volume $UPLOAD_IMG (provided with --upload-to-img)"
 
-  echo ">>> Uploading $local_image_to_upload to $UPLOAD_POOL/$UPLOAD_IMG"
-  virsh_cmd vol-upload --pool "$UPLOAD_POOL" "$UPLOAD_IMG" "$local_image_to_upload"
-  if [ $? -ne 0 ] ; then
-    echo >&2 "FATAL: could not upload to volume $UPLOAD_IMG from $local_image_to_upload. Aborting."
-    exit 1
-  fi
+  log "Uploading $IMG_LOCAL_NAME to $UPLOAD_POOL/$UPLOAD_IMG"
+  virsh_cmd vol-upload --pool "$UPLOAD_POOL" "$UPLOAD_IMG" "$IMG_LOCAL_NAME" || \
+    abort "could not upload to volume $UPLOAD_IMG (provided with --upload-to-img) from $IMG_LOCAL_NAME"
 
-  echo ">>> Giving some time to the upload"
+  log "Giving some time to the upload"
   sleep 20
 fi
 
-echo ">>> Done!."
+log "Done!."
 exit 0

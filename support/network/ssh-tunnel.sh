@@ -51,8 +51,8 @@ MTU=1500
 EXTRA_OPTS='-oCompression=yes -oServerAliveInterval=10 -oTCPKeepAlive=yes'
 
 # Local and remote tunnel devices (ie, 5 for tun5/tap5)
-LOCAL_DEV=4
-REMOTE_DEV=4
+LOCAL_DEV=6
+REMOTE_DEV=6
 
 # route to a specific subnet
 ROUTE_TO=
@@ -73,6 +73,7 @@ UP_SCRIPT=$(dirname $0)/ssh-tunnel-up.sh
 
 now()   { date +'%Y-%m-%d %H:%M:%S' ; }
 log()   { echo "# $(now) [INFO] $@" ; }
+warn()  { echo "# $(now) [WARN] $@" ; }
 abort() { echo "# $(now) [ERROR] $@" ; exit 1 ; }
 quit()  { log "$@" ; exit 0 ; }
 
@@ -173,6 +174,13 @@ kill_ssh() {
   [[ -n "$pid" ]] && $SUDO_CMD kill $pid
 }
 
+remove_remote_tap() {
+  log "Trying to remove $FULL_REMOTE_DEV from $TAP_RBRIDGE at $REMOTE"
+  ssh $SSH_COMMON_ARGS $REMOTE \
+    "brctl delif $TAP_RBRIDGE $FULL_REMOTE_DEV 2>/dev/null" || /bin/true
+  ssh $SSH_COMMON_ARGS $REMOTE "brctl show" | grep $FULL_REMOTE_DEV 2>/dev/null
+}
+
 if [[ -n "$STOP" ]] ; then
   kill_ssh
   trap "log Removing $STATE_FILE ; rm -f $STATE_FILE ; exit 0" INT TERM EXIT
@@ -181,8 +189,7 @@ if [[ -n "$STOP" ]] ; then
     log "Nothing else to do for a point-to-point connection"
   elif [[ "$TUNNEL_TYPE" = "ethernet" ]] ; then
     if [[ -n "$KEY" ]] && [[ -n "$REMOTE" ]] && [[ -n "$TAP_RBRIDGE" ]] ; then
-      log "Trying to removing remote interface $TAP_RBRIDGE at $REMOTE"
-      ssh $SSH_COMMON_ARGS $REMOTE "brctl delif $TAP_RBRIDGE $FULL_REMOTE_DEV 2>/dev/null" || /bin/true
+      remove_remote_tap
     fi
 
     log "Current local bridges:"
@@ -203,6 +210,10 @@ if [[ -n "$STATE_LOADED" ]] ; then
   fi
 
   log "Tunnel device is not present: forcing restart"
+  if [[ "$TUNNEL_TYPE" = "ethernet" ]] && [[ -n "$KEY" ]] && [[ -n "$REMOTE" ]] && [[ -n "$TAP_RBRIDGE" ]] ; then
+    remove_remote_tap
+  fi
+
   kill_ssh
   rm -f $STATE_FILE
 fi
@@ -223,7 +234,7 @@ fi
 if [[ "$TUNNEL_TYPE" = "point-to-point" ]] ; then
   SSH_REMOTE_CMD="/sbin/ifconfig $FULL_REMOTE_DEV $REMOTE_IP netmask $NETMASK pointopoint $LOCAL_IP up"
 elif [[ "$TUNNEL_TYPE" = "ethernet" ]] ; then
-  SSH_REMOTE_CMD="ifconfig $FULL_REMOTE_DEV up && brctl addif $TAP_RBRIDGE $FULL_REMOTE_DEV"
+  SSH_REMOTE_CMD="ifconfig $FULL_REMOTE_DEV up && ( brctl delif $TAP_RBRIDGE $FULL_REMOTE_DEV 2>/dev/null || /bin/true ) && brctl addif $TAP_RBRIDGE $FULL_REMOTE_DEV"
 fi
 
 log "Starting ssh connection..."

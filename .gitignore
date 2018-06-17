@@ -31,3 +31,4 @@ e2e-images.lst
 kubeconfig
 
 
+.vscode/*

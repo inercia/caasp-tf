@@ -454,6 +454,12 @@ script_group.add_argument('--script-begin',
                           metavar='STAGE',
                           default='',
                           help='process the script after stage <STAGE>')
+script_group.add_argument('--script-stage',
+                          action='append',
+                          dest='script_stage',
+                          metavar='STAGE',
+                          default=[],
+                          help='process only the stage <STAGE> in the script (can be provided multiple times)')
 
 files_group = parser.add_argument_group(
     title='Copies and Files',
@@ -666,7 +672,8 @@ def run(cmd, sudo=False, password=None, timeout=None):
             cmd = "sudo -S %s" % (cmd)
 
     log.debug('exec: running "%s"', cmd)
-    popen = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, universal_newlines=True)
+    popen = subprocess.Popen(
+        cmd, shell=True, stdout=subprocess.PIPE, universal_newlines=True)
     if timeout:
         timer = Timer(timeout, popen.kill)
 
@@ -698,8 +705,9 @@ def run_interactive(cmd, sudo=False, password=None):
 
 
 def print_iterator(it, **kwargs):
-    for line in it:
-        print(line, end='', **kwargs)
+    if it:
+        for line in it:
+            print(line, end='', **kwargs)
 
 ####################################################################
 # Terraform
@@ -793,7 +801,8 @@ def tf_load_statex(vars={}, vars_files=[], tfstate=None):
             try:
                 res_stored = json.load(tfstatex)
             except ValueError as e:
-                log.error('statex: could not decode the JSON in %s: %s', tfstatex_filename, e)
+                log.error('statex: could not decode the JSON in %s: %s',
+                          tfstatex_filename, e)
             else:
                 log.debug('statex: file loaded successfully')
                 res['vars'].update(res_stored['vars'])
@@ -839,7 +848,8 @@ def tf_get_extra_output(name, tf_state=None):
         res = res.decode('utf-8')
         res = res.rstrip()
     except Exception as e:
-        log.debug('terraform: could not obtain output variable "%s" from Terraform: %s', name, e)
+        log.debug(
+            'terraform: could not obtain output variable "%s" from Terraform: %s', name, e)
     else:
         log.debug('terraform: obtained "%s"="%s"', name, res)
 
@@ -857,7 +867,8 @@ def run_tf(subcmd, extra='', vars={}, vars_files=[], outputs=[], tf_state=None, 
     vars_str = ''
     var_files_str = ''
 
-    log.debug('terraform: trying to find presets files to autoload in %s...', workdir)
+    log.debug(
+        'terraform: trying to find presets files to autoload in %s...', workdir)
     for try_file in ENV_TFVARS_FILES:
         try_file = os.path.abspath(os.path.join(workdir, try_file))
         if os.path.exists(try_file) and try_file not in vars_files:
@@ -869,13 +880,15 @@ def run_tf(subcmd, extra='', vars={}, vars_files=[], outputs=[], tf_state=None, 
     if args.tf_copies:
         # ... then add the tfvars for salt_dir and manifest_dir
         if args.copy_salt_code and args.salt_dir:
-            log.debug('terraform: adding variable "%s" for Salt: %s', TFVAR_SALT_DIR, args.salt_dir)
+            log.debug('terraform: adding variable "%s" for Salt: %s',
+                      TFVAR_SALT_DIR, args.salt_dir)
             vars_str += ' -var \'{}={}\''.format(TFVAR_SALT_DIR, args.salt_dir)
 
         if args.copy_manifests and args.manifests_dir:
             log.debug('terraform: adding variable "%s" for manifests: %s',
                       TFVAR_MANIFESTS_DIR, args.manifests_dir)
-            vars_str += ' -var \'{}={}\''.format(TFVAR_MANIFESTS_DIR, args.manifests_dir)
+            vars_str += ' -var \'{}={}\''.format(
+                TFVAR_MANIFESTS_DIR, args.manifests_dir)
 
     # Add the tfvar/tfvars provided in command line
     for command_line_var in args.tfvar:
@@ -903,7 +916,8 @@ def run_tf(subcmd, extra='', vars={}, vars_files=[], outputs=[], tf_state=None, 
             log.debug('terraform: creating temporal terraform file %s', filename)
 
             for name in outputs:
-                contents = '''output "''' + name + '''" { value = "${var.''' + name + '''}" }'''
+                contents = '''output "''' + name + \
+                    '''" { value = "${var.''' + name + '''}" }'''
                 log.debug('terraform: adding: %s', contents)
                 tt.write(contents + '\n')
 
@@ -959,7 +973,8 @@ def tf_plan(**kwargs):
     # try to use vars/vars_files form the statex file
     # if some vars/vars_files are defined in the current env,
     # they will be used instead
-    statex = tf_load_statex(vars=kwargs.pop('vars', {}), vars_files=kwargs.pop('vars_files', {}))
+    statex = tf_load_statex(vars=kwargs.pop('vars', {}),
+                            vars_files=kwargs.pop('vars_files', {}))
     try:
         yield from run_tf('plan',
                           vars=statex['vars'], vars_files=statex['vars_files'], **kwargs)
@@ -973,7 +988,8 @@ def tf_destroy(**kwargs):
     # try to use vars/vars_files form the statex file
     # if some vars/vars_files are defined in the current env,
     # they will be used instead
-    statex = tf_load_statex(vars=kwargs.pop('vars', {}), vars_files=kwargs.pop('vars_files', {}))
+    statex = tf_load_statex(vars=kwargs.pop('vars', {}),
+                            vars_files=kwargs.pop('vars_files', {}))
     try:
         yield from run_tf('destroy', extra='-force',
                           vars=statex['vars'], vars_files=statex['vars_files'], **kwargs)
@@ -987,7 +1003,8 @@ def tf_refresh(**kwargs):
     # try to use vars/vars_files form the statex file
     # if some vars/vars_files are defined in the current env,
     # they will be used instead
-    statex = tf_load_statex(vars=kwargs.pop('vars', {}), vars_files=kwargs.pop('vars_files', {}))
+    statex = tf_load_statex(vars=kwargs.pop('vars', {}),
+                            vars_files=kwargs.pop('vars_files', {}))
     for _ in range(0, 5):
         try:
             yield from run_tf('refresh',
@@ -1024,9 +1041,9 @@ def tf_vms_ip_for(vm_name, vms=None):
         try:
             res.append(vms[name])
         except KeyError as e:
-            log.error('VM %s does not seem to exist', name)
+            log.error('terraform: VM %s does not seem to exist', name)
             if vms.keys():
-                log.error('valid names: %s', " ".join(vms.keys()))
+                log.error('terraform: valid names: %s', " ".join(vms.keys()))
 
     return res
 
@@ -1065,7 +1082,8 @@ def tf_find_for(vm, vms=None):
     names = tf_vms_names(vms)
     for name in names:
         if vm in name:
-            log.debug('Name "%s" matches "%s": running commands there', vm, name)
+            log.debug(
+                'terraform: name "%s" matches "%s": running commands there', vm, name)
             return name
 
     raise CommandError('could not find matching VM name for {}'.format(vm))
@@ -1076,17 +1094,10 @@ def print_iterator_for_vm(fun, vm, *args, **kwargs):
         print('{vm}: {line}'.format(**locals()), end='', flush=True)
 
 
-def map_on_par(fun, *args, **kwargs):
-    from multiprocessing import Pool
-    from functools import partial
-
-    vms = tf_load_state()
-    vm_names = tf_vms_names(vms)
-    with Pool(max(1, len(vm_names))) as p:
-        p.map(partial(print_iterator_for_vm, fun, *args, **kwargs), vm_names)
-
-
 def map_vms_par(vms, fun, *args, **kwargs):
+    '''
+    Map a function (that yields lines) to all the VMs
+    '''
     from multiprocessing import Pool
     from functools import partial
 
@@ -1157,7 +1168,8 @@ def run_ssh_cmd(vm, cmd, quiet=True, ignore_errors=False, timeout=None):
         if ignore_errors:
             log.error('could not run "%s" on %s: %s', cmd, vm, e)
         else:
-            raise SSHException('{} failed with return code {}'.format(cmd, e.returncode))
+            raise SSHException(
+                '{} failed with return code {}'.format(cmd, e.returncode))
 
 
 def run_ssh_session(vm, cmd='', quiet=True):
@@ -1181,7 +1193,8 @@ def run_ssh_session(vm, cmd='', quiet=True):
     try:
         return run_interactive(ssh_cmd)
     except subprocess.CalledProcessError as e:
-        raise SSHException('{} failed with return code {}'.format(cmd, e.returncode))
+        raise SSHException(
+            '{} failed with return code {}'.format(cmd, e.returncode))
 
 
 def run_rsync(src, vm, dst, timeout=None, **kwargs):
@@ -1195,7 +1208,8 @@ def run_rsync(src, vm, dst, timeout=None, **kwargs):
     vm_name = tf_find_for(vm, vms=vms)
     dst_addrs = tf_vms_ip_for(vm_name, vms=vms)
     if not dst_addrs:
-        raise SSHException('could not find a an address for {vm}'.format(**locals()))
+        raise SSHException(
+            'could not find a an address for {vm}'.format(**locals()))
 
     dst_addr = dst_addrs[0]
 
@@ -1206,11 +1220,13 @@ def run_rsync(src, vm, dst, timeout=None, **kwargs):
     rsync_opts = "{rsync_args} {exclude} -e '{ssh_cmd}'".format(**locals())
 
     log.info('copy: %s -> %s (%s):%s', src, vm, dst_addr, dst)
-    cmd = '{rsync_cmd} {rsync_opts} {src} root@{dst_addr}:{dst}'.format(**locals())
+    cmd = '{rsync_cmd} {rsync_opts} {src} root@{dst_addr}:{dst}'.format(
+        **locals())
     try:
         yield from run(cmd, timeout=timeout)
     except subprocess.CalledProcessError as e:
-        raise SSHException('{} failed with return code {}'.format(cmd, e.returncode))
+        raise SSHException(
+            '{} failed with return code {}'.format(cmd, e.returncode))
 
 
 def run_scp(src, dst, timeout=None, **kwargs):
@@ -1240,6 +1256,25 @@ def run_caaspctl_admin(cmd):
     yield from run_caaspctl(get_admin_name(), cmd)
 
 
+def wait_ssh(vm=None, timeout=CONTAINER_START_TIMEOUT):
+    '''
+    Wait until we can ssh/scp into a machine
+    '''
+    vm = vm or get_admin_name()
+    timeout_limit = datetime.now() + timedelta(seconds=timeout)
+    while datetime.now() <= timeout_limit:
+        try:
+            _ = list(run_ssh_cmd(vm, 'echo ping'))
+        except Exception as e:
+            log.debug('error when waiting for %s: %s', vm, e)
+            time.sleep(5)
+        else:
+            log.debug('VM %s seems to be reachable', vm)
+            return
+
+    raise TimeoutError('timeout while waiting for "{}"'.format(vm))
+
+
 def wait_container(cont, vm=None, timeout=CONTAINER_START_TIMEOUT):
     '''
     Wait for a container in the Admin node
@@ -1258,7 +1293,8 @@ def wait_container(cont, vm=None, timeout=CONTAINER_START_TIMEOUT):
             log.debug('container %s seems to be up in %s', cont, vm)
             return
 
-    raise TimeoutError('timeout while waiting for container {} at {}'.format(cont, vm))
+    raise TimeoutError(
+        'timeout while waiting for container "{}" at "{}"'.format(cont, vm))
 
 
 def run_salt(where, cmd):
@@ -1352,7 +1388,8 @@ def get_virsh_uri():
     try:
         return tf_get_extra_output(TERRAFORM_LIBVIRT_URI_VAR)
     except Exception as e:
-        log.debug('virsh: could not get libvirt URI from terraform state file: %s', e)
+        log.debug(
+            'virsh: could not get libvirt URI from terraform state file: %s', e)
         return None
 
 
@@ -1416,7 +1453,8 @@ def virsh_create_snapshot_for_vm(vm, pre_suspend=True,
     if pre_suspend:
         yield from virsh_suspend_for_vm(vm)
 
-    log.info('virsh: creating snapshot for %s (%d secs timeout)...', vm, VIRSH_SNAPSHOT_TIMEOUT)
+    log.info('virsh: creating snapshot for %s (%d secs timeout)...',
+             vm, VIRSH_SNAPSHOT_TIMEOUT)
     yield from run_virsh(cmd, timeout=VIRSH_SNAPSHOT_TIMEOUT)
 
 
@@ -1468,7 +1506,10 @@ def virsh_power_on_for_vm(vm, **kwargs):
     yield from run_virsh('start --domain {}'.format(vm), ignore_error=True)
 
 
-def virsh_rollback_for_vm(vm, pre_suspend=True, post_running=True, **kwargs):
+def virsh_rollback_for_vm(vm, name=None, pre_suspend=True, post_running=True, **kwargs):
+    '''
+    Rollback the VM to the snapshot `name` (or the the current/latest one)
+    '''
     assert(isinstance(vm, str))
 
     status = virsh_status_for(vm)
@@ -1483,17 +1524,26 @@ def virsh_rollback_for_vm(vm, pre_suspend=True, post_running=True, **kwargs):
         yield from virsh_suspend_for_vm(vm)
 
     sargs = ''
+
+    if not name:
+        log.info('virsh: rolling back %s to latest snapshot', vm)
+        sargs += ' --current'
+    else:
+        log.info('virsh: rolling back %s to "%s"', vm, name)
+        sargs += ' ' + name
+
     if post_running:
         sargs += ' --running'
 
-    log.info('virsh: rolling back %s', vm)
-    yield from run_virsh('snapshot-revert {sargs} --current --domain {vm}'.format(**locals()), ignore_error=True)
+    yield from run_virsh('snapshot-revert --domain {vm} {sargs}'.format(**locals()), ignore_error=True)
+    yield from run_virsh('snapshot-info --current {vm}'.format(**locals()), ignore_error=True)
 
 
 def virsh_sync_time_form_vm(vm):
     assert(isinstance(vm, str))
     log.info('virsh: synchronizing time host<->%s', vm)
-    cmd = ''' qemu-agent-command {} '{"execute":"guest-set-time"}' '''.format(vm)
+    cmd = ''' qemu-agent-command {} '{"execute":"guest-set-time"}' '''.format(
+        vm)
     yield from run_virsh(cmd, ignore_error=True)
 
 
@@ -1543,7 +1593,8 @@ def get_differences(src, vm, dst):
                 if value is not None:
                     res[category] = value
     except SSHException as e:
-        log.error('copy: could not find differences between %s and %s:%s: %s', src, vm, dst, e)
+        log.error(
+            'copy: could not find differences between %s and %s:%s: %s', src, vm, dst, e)
 
     return res
 
@@ -1554,34 +1605,40 @@ def get_current_branch_in(dir):
             return line.strip()
 
 
-def copy_code_to(code_src_dir, code_remote_dir, vm, description):
+def copy_code_to(code_src_dir, branch, code_remote_dir, vm, description):
     if not os.path.exists(code_src_dir):
-        raise CommandError('could not find {} code at {}'.format(description, code_src_dir))
+        raise CommandError('could not find {} code at {}'.format(
+            description, code_src_dir))
 
-    log.info('copy: copying %s code (in %s) to the Admin node', description, code_src_dir)
+    log.info('copy: copying %s code (in %s) to the Admin node',
+             description, code_src_dir)
     dst = code_remote_dir
     src = None
     tmp_src = None
     try:
-        if args.salt_branch:
-            branch = args.salt_branch.strip()
+        if branch:
+            branch = branch.strip()
             salt_dir_branch = get_current_branch_in(code_src_dir)
             if branch == salt_dir_branch:
                 log.warn('copy: same branch checked out in %s', code_src_dir)
             else:
-                log.debug('copy: current branch in %s: %s', code_src_dir, salt_dir_branch)
+                log.debug('copy: current branch in %s: %s',
+                          code_src_dir, branch)
 
                 src = tmp_src = tempfile.mkdtemp()
-                log.info('copy: creating working tree in "%s" for branch "%s"',
-                         tmp_src, args.salt_branch)
+                log.info('copy: creating working tree in "%s" for %s branch "%s"',
+                         tmp_src, description, branch)
                 with cd(code_src_dir):
-                    worktree_cmd = 'git worktree add {tmp_src} {branch}'.format(**locals())
+                    worktree_cmd = 'git worktree add {tmp_src} {branch}'.format(
+                        **locals())
                     yield from run(worktree_cmd)
 
                 worktree_branch = get_current_branch_in(tmp_src)
-                log.info('copy: branch in the working tree: %s', worktree_branch)
+                log.info('copy: branch in the working tree: %s',
+                         worktree_branch)
                 if worktree_branch != branch:
-                    raise CommandError('could not create a worktree for branch {}'.format(branch))
+                    raise CommandError(
+                        'could not create a worktree for branch {}'.format(branch))
 
         if not src:
             log.debug('copy: will copy current checkout')
@@ -1638,17 +1695,18 @@ def copy_to_admin_code(skip_reboot=False, **kwargs):
     vm = get_admin_name()
 
     if args.copy_salt_code and args.salt_dir:
-        yield from copy_code_to(args.salt_dir, DEFAULT_SALT_REM, vm, 'Salt')
+        yield from copy_code_to(args.salt_dir, args.salt_branch, DEFAULT_SALT_REM, vm, 'Salt')
 
     if args.copy_manifests and args.manifests_dir:
         diffs = get_differences(args.manifests_dir, vm, DEFAULT_MANIFESTS_REM)
         if any(x > 0 for x in diffs.values()):
             log.info('copy: detected differences in the manifests: %s', diffs)
-            yield from copy_code_to(args.manifests_dir, DEFAULT_MANIFESTS_REM, vm, 'manifests')
+            yield from copy_code_to(args.manifests_dir, args.manifests_branch, DEFAULT_MANIFESTS_REM, vm, 'manifests')
             yield from run_ssh_cmd(get_admin_name(), 'sh {}'.format(ADMIN_NODE_SETUP))
 
             if skip_reboot:
-                log.warn('copy: skipping reboot. Manifests will not take effect...')
+                log.warn(
+                    'copy: skipping reboot. Manifests will not take effect...')
             else:
                 log.info('copy: rebooting the Admin machine')
                 yield from virsh_reboot(get_admin_name())
@@ -1676,9 +1734,7 @@ def copy_to_node(vm, **kwargs):
 def copy_to_nodes(**kwargs):
     '''Perform all the copies necessary for the nodes.'''
     log.debug('copy: copying files to the Nodes')
-    nodes = tf_vms_nodes()
-    for vm in nodes:
-        copy_to_node(vm)
+    map_all_vms_par(copy_to_node)
 
 
 def copy_file_from(vm, src, dst='./', orig_user='root'):
@@ -1688,7 +1744,8 @@ def copy_file_from(vm, src, dst='./', orig_user='root'):
     vm_name = tf_find_for(vm, vms=vms)
     addrs = tf_vms_ip_for(vm_name, vms=vms)
     if not addrs:
-        raise SSHException('copy: could not find a an address for {vm}'.format(**locals()))
+        raise SSHException(
+            'copy: could not find a an address for {vm}'.format(**locals()))
 
     addr = addrs[0]
     src_expr = '{orig_user}@{addr}:{src}'.format(**locals())
@@ -1697,14 +1754,17 @@ def copy_file_from(vm, src, dst='./', orig_user='root'):
     yield from run_scp(src=src_expr, dst=dst_expr)
 
 
-def copy_file_to(src, vm, dst=None, container=None, dst_user='root'):
-    '''Perform a SCP copy from the local machine to a VM.'''
+def copy_file_to(src, vm, dst='', container=None, dst_user='root'):
+    '''
+    Perform a SCP copy from the local machine to a VM.
+    '''
     log.debug('copy: copying file %s -> %s:%s', src, vm, dst)
     vms = tf_load_state()
     vm_name = tf_find_for(vm, vms=vms)
     addrs = tf_vms_ip_for(vm_name, vms=vms)
     if not addrs:
-        raise SSHException('copy: could not find a an address for {vm}'.format(**locals()))
+        raise SSHException(
+            'copy: could not find a an address for {vm}'.format(**locals()))
 
     addr = addrs[0]
     src_expr = '{src}'.format(**locals())
@@ -1722,7 +1782,8 @@ def copy_file_to(src, vm, dst=None, container=None, dst_user='root'):
 
     if container:
         cid = get_cid(addr, container)
-        log.info('copy: %s:%s -> %s:%s:%s', addr, temp_filename, addr, cid, dst)
+        log.info('copy: %s:%s -> %s:%s:%s', addr,
+                 temp_filename, addr, cid, dst)
         cmd = 'docker cp {temp_filename} {cid}:{dst}'.format(**locals())
         yield from(run_ssh_cmd(addr, cmd))
 
@@ -1848,11 +1909,13 @@ class CmdBase(Cmd):
 
                 if not self.is_interactive():
                     # we are running in batch mode
-                    log.critical(on_color('RED', 'exception catched in batch mode: %s'), e)
+                    log.critical(
+                        on_color('RED', 'exception catched in batch mode: %s'), e)
                     self.abort()
 
                 log.critical(on_color('RED', 'exception catched !!! %s'), e)
-                log.critical(on_color('RED', 'get more details with "traceback".'))
+                log.critical(
+                    on_color('RED', 'get more details with "traceback".'))
 
     def precmd(self, line):
         if line.lstrip().startswith('#'):
@@ -1865,7 +1928,8 @@ class CmdBase(Cmd):
         def sh_replacer(text):
             cmd = text[1:-1]  # remove the ``
             log.debug('replacing %s by shell output', cmd)
-            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True)
+            out = subprocess.check_output(
+                cmd, stderr=subprocess.STDOUT, shell=True)
             return str(out.decode('utf-8').rstrip())
         line = replace_pattern(r"`.*`", sh_replacer, line)
 
@@ -1889,7 +1953,7 @@ class CmdBase(Cmd):
 
         if line.startswith('!'):
             # run a local command
-            return self.do_sh(line[1:])
+            return self.do_shell(line[1:])
 
         if line.startswith('@'):
             # run a command in a VMs
@@ -1901,6 +1965,9 @@ class CmdBase(Cmd):
         super().default(line)
 
     def try_rc_files(self, rc_files, directory=None):
+        if args.skip_rc_files:
+            return
+
         directory = directory or CURR_DIR
 
         log.debug('rc files: trying to load from "%s"', directory)
@@ -1914,15 +1981,19 @@ class CmdBase(Cmd):
                     self.load_script(maybe_rc_file)
                     log.debug('rc files: %s loaded', maybe_rc_file)
                 except Exception as e:
-                    log.critical('rc files: could not read "%s": %s', maybe_rc_file, e)
+                    log.critical(
+                        'rc files: could not read "%s": %s', maybe_rc_file, e)
                     sys.exit(1)
 
     def try_stage_rc_files(self, stage):
-        env_dir = os.path.join(args.env_dir, args.env)
-        if os.path.exists(env_dir):
-            log.debug('rc files: trying to load all the "%s" resource files', stage)
-            try_rc_files = [x.format(stage=stage) for x in ENV_STAGE_RC_FILES]
-            caasp_cmd.try_rc_files(try_rc_files, directory=env_dir)
+        if not args.skip_rc_files:
+            env_dir = os.path.join(args.env_dir, args.env)
+            if os.path.exists(env_dir):
+                log.debug(
+                    'rc files: trying to load all the "%s" resource files', stage)
+                try_rc_files = [x.format(stage=stage)
+                                for x in ENV_STAGE_RC_FILES]
+                caasp_cmd.try_rc_files(try_rc_files, directory=env_dir)
 
     def load_script(self, script):
         if self.top:
@@ -1945,9 +2016,8 @@ class CmdBase(Cmd):
             with open(script, 'rt') as script_fd:
                 self.stdin = script_fd
                 self.cmdloop()
+                script_fd.close()
         finally:
-            script_fd.close()
-
             # restore the previous settings
             self.stdin = old_stdin
             self.prompt = old_prompt
@@ -2072,7 +2142,6 @@ class CmdBase(Cmd):
         if pre_msg:
             notify(pre_msg, icon=icon)
 
-        self.try_rc_files(CAASP_RC_FILES, directory=get_work_dir())
         if stage:
             self.try_stage_rc_files('pre-' + stage)
 
@@ -2112,14 +2181,23 @@ class CmdBase(Cmd):
         if not line:
             raise CommandError('no stage specified')
 
-        stage = line
+        stage = line.strip()
 
         if args.script_begin and str(stage) == str(args.script_begin):
-            log.info('***********************************************')
-            log.info('stage: "%s"', stage)
+            log.info(
+                'stage: ************************ %s ************************', stage)
+            log.debug('stage: unblocking input')
             self.blocked = False
-            log.info('***********************************************')
-            log.debug('(unblocking input)')
+        elif args.script_stage:
+            if stage in args.script_stage:
+                log.info(
+                    'stage: ************************ %s ************************', stage)
+                log.debug('stage: unblocking input')
+                self.blocked = False
+            else:
+                log.debug(
+                    'stage: %s not in the stages list: blocking input', stage)
+                self.blocked = True
         else:
             log.debug('stage: "%s"', stage)
             log.debug('(waiting for stage "%s")', args.script_begin)
@@ -2214,7 +2292,21 @@ class CaaSPSSH(CmdBase):
         '''
         with self._operation():
             notify('Rebooting the cluster', icon='reload')
-            run_ssh_all('{} reboot'.format(args.vm_caaspctl), ignore_errors=True)
+            run_ssh_all('{} reboot'.format(
+                args.vm_caaspctl), ignore_errors=True)
+
+    def do_wait(self, line):
+        '''
+        Wait for ssh connectivity to one (or more) machines
+        '''
+        if len(line) == 0:
+            raise CommandError('No vm(s) provided')
+
+        for vm_name in line.split(' '):
+            vm = tf_find_for(vm_name)
+            log.info('Waiting for ssh reachability to %s', vm)
+            wait_ssh(vm)
+            log.info('... %s seems to be reachable', vm)
 
 
 def _complete_path(path):
@@ -2327,14 +2419,16 @@ class CaaSPCluster(CmdBase):
             self.do_tfvar('')
             self.do_tfvars('')
 
-            print_iterator(tf_plan(vars=self.vars, vars_files=self.vars_files), flush=True)
+            print_iterator(
+                tf_plan(vars=self.vars, vars_files=self.vars_files), flush=True)
 
     def do_destroy(self, line):
         '''Destroy the cluster.'''
         tfstate = get_tfstate_filename()
 
         if not os.path.exists(tfstate):
-            log.error('no Terraform state file found: it seems there is nothing to destroy !!')
+            log.error(
+                'no Terraform state file found: it seems there is nothing to destroy !!')
             tf_cleanup()
             return
 
@@ -2368,7 +2462,8 @@ class CaaSPCluster(CmdBase):
         tfstate = get_tfstate_filename()
 
         if not os.path.exists(tfstate):
-            log.warning('no Terraform state file found: it seems there is nothing to destroy !!')
+            log.warning(
+                'no Terraform state file found: it seems there is nothing to destroy !!')
 
         with self._operation('destroy',
                              pre_msg='Destroying the cluster',
@@ -2400,7 +2495,8 @@ class CaaSPCluster(CmdBase):
             name = tf_find_for(line)
             ips = tf_vms_ip_for(name)
             if not ips:
-                raise InvalidMachineError('could not find a valid IP for %s'.format(name))
+                raise InvalidMachineError(
+                    'could not find a valid IP for {}'.format(name))
 
             print(ips[0])
 
@@ -2471,8 +2567,9 @@ class CaaSPCluster(CmdBase):
                              icon='revert'):
             log.info('Creating snapshots')
             kwargs = get_assign_from_str(line)
-            # suspend, snapshot and resume (all at the same time) the VMs
-            map_all_vms_par(virsh_create_snapshot_for_vm, pre_suspend=True, **kwargs)
+            # suspend, snapshot and resume (all VMs at the same time)
+            map_all_vms_par(virsh_create_snapshot_for_vm,
+                            pre_suspend=True, **kwargs)
             map_all_vms_par(virsh_resume_for_vm)
 
     def do_snapshots(self, line):
@@ -2536,6 +2633,7 @@ class CaaSPCluster(CmdBase):
         Optional arguments:
 
         * `running`: resume the machine after rolling back.
+        * `name`: rollback to the snapshot named `name`
         '''
         kwargs = {'running': True}
         kwargs.update(get_assign_from_str(line))
@@ -2544,7 +2642,11 @@ class CaaSPCluster(CmdBase):
                              pre_msg='Rolling back the cluster',
                              post_msg='Cluster rolled back',
                              icon='undo'):
-            map_all_vms_par(virsh_rollback_for_vm, post_running=kwargs.get('running', True))
+
+            post_running = kwargs.pop('running', True)
+
+            map_all_vms_par(virsh_rollback_for_vm,
+                            post_running=post_running, **kwargs)
             # make sure the VMs are running: otherwise, refresh will fail
             map_all_vms_par(virsh_resume_for_vm)
             print_iterator(tf_refresh())
@@ -2590,15 +2692,17 @@ class CaaSPCluster(CmdBase):
         vm = tf_find_for(line[0])
 
         with self._operation('reboot',
-                             pre_msg='Rebooting the cluster',
-                             post_msg='Cluster rebooted',
+                             pre_msg='Rebooting ' + vm,
+                             post_msg=vm + ' rebooted',
                              icon='revert'):
             print_iterator(virsh_reboot(vm))
             wait_for = kwargs.get('wait_for', '')
             if wait_for:
-                log.info('Waiting for container %s in %s', wait_for, vm)
+                log.info('Waiting for "%s" container in "%s"', wait_for, vm)
                 time.sleep(5)
-                print_iterator(wait_container('salt', vm=vm))
+                print_iterator(wait_container(wait_for, vm=vm))
+                log.info(
+                    'The "%s" container seems to be available in "%s"', wait_for, vm)
 
 ###################
 # Salt stuff
@@ -2650,15 +2754,18 @@ class CaaSPSalt(CmdBase):
             nodes = tf_vms_nodes()
             wait_for = len(nodes.keys())
 
-        log.info('waiting for %s (+%d) Salt minions to be accepted', wait_for, SALT_KEYS_EXTRA_WAIT)
+        log.info('waiting for %s (+%d) Salt minions to be accepted',
+                 wait_for, SALT_KEYS_EXTRA_WAIT)
 
         # add the 'ca' and 'admin' Salt minions
         wait_for += SALT_KEYS_EXTRA_WAIT
 
         with self._operation():
             try:
+                wait_ssh()
                 print_iterator(copy_to_admin())
-                print_iterator(run_caaspctl_admin(CAASPCTL_MINIONS_ACCEPT.format(num=wait_for)))
+                print_iterator(run_caaspctl_admin(
+                    CAASPCTL_MINIONS_ACCEPT.format(num=wait_for)))
             except SSHException as e:
                 log.critical('could not wait for Salt minions: %s', e)
                 raise
@@ -2673,7 +2780,8 @@ class CaaSPSalt(CmdBase):
         '''
         line_comps = line.split(' ')
         if len(line_comps) != 2:
-            raise CommandError('setting pillars requires two arguments: the key and the value')
+            raise CommandError(
+                'setting pillars requires two arguments: the key and the value')
 
         key, value = line_comps
         log.info('Setting the %s to %s', key, value)
@@ -2688,7 +2796,8 @@ class CaaSPSalt(CmdBase):
         if line:
             line_comps = line.split(' ')
             if len(line_comps) != 2:
-                raise CommandError('get pillar requires two arguments: the key and the value')
+                raise CommandError(
+                    'get pillar requires two arguments: the key and the value')
 
             key, where = line_comps
             log.info('Getting %s at %s', key, where)
@@ -2698,7 +2807,8 @@ class CaaSPSalt(CmdBase):
 
         with self._operation():
             print_iterator(copy_to_admin())
-            print_iterator(run_caaspctl_admin(CAASPCTL_GET_PILLAR.format(**locals())))
+            print_iterator(run_caaspctl_admin(
+                CAASPCTL_GET_PILLAR.format(**locals())))
 
     def do_apply(self, line):
         '''
@@ -2777,7 +2887,8 @@ class CaaSPCtl(CmdBase):
             if line:
                 print_iterator(run_caaspctl_admin(line))
             else:
-                log.debug('Starting %s in the Admin node []', args.vm_caaspctl, get_admin_name())
+                log.debug('Starting %s in the Admin node %s',
+                          args.vm_caaspctl, get_admin_name())
                 run_ssh_session(get_admin_name(), args.vm_caaspctl)
 
 
@@ -2790,14 +2901,14 @@ class CaaSPOrch(CmdBase):
     prompt = prompt('caasp:orch')
 
     def _prepare_orchestration(self, orch, orch_args):
-        notify('preparing', summary=orch + ' orchestration', icon='start')
-        log.info('Preparing {orch} orchestration...'.format(**locals()))
+        notify('preparing', summary='pre-orchestration', icon='start')
+        log.info('Preparing orchestration...'.format(**locals()))
 
         print_iterator(copy_enable())
         print_iterator(copy_to_admin())
         print_iterator(copy_to_admin_code())
 
-        log.info('Running pre-"{orch}" orchestration commands...'.format(**locals()))
+        log.info('Running pre-orchestration commands...')
 
         date = datetime.now().strftime(DATE_FMT)
         date_fmt = DATE_FMT
@@ -2809,18 +2920,18 @@ class CaaSPOrch(CmdBase):
             log.debug('Running "%s" in all the machines', line)
             run_ssh_all(line)
         except Exception as e:
-            log.error('could not run pre-orch commands')
+            log.error('could not run pre-orch commands: %s', e)
 
-        notify('resources copied', summary=orch + ' orchestration', icon='start')
+        notify('resources copied', summary='pre-orchestration', icon='start')
 
         for ctl_cmd in ORCH_PREPARE_CAASPCTL_CMDS:
             print_iterator(run_caaspctl_admin(ctl_cmd.format(**locals())))
 
-    def _run_orchestration(self, orch, orch_args, prepare=True, pre_orch_rcs=True,  post_orch_rcs=True):
+    def _run_orchestration(self, orch, orch_args, prepare=True,
+                           pre_orch_rcs=True,  post_orch_rcs=True):
         assert(orch)
 
-        if pre_orch_rcs:
-            self.try_rc_files(CAASP_RC_FILES, directory=get_work_dir())
+        if pre_orch_rcs and not args.skip_rc_files:
             self.try_stage_rc_files('pre-orch')
 
         if prepare:
@@ -2835,7 +2946,7 @@ class CaaSPOrch(CmdBase):
         notify('finish', summary=orch + ' orchestration', icon='start')
         remove_kubeconfig()
 
-        if post_orch_rcs:
+        if post_orch_rcs and not args.skip_rc_files:
             self.try_stage_rc_files('post-orch')
 
     def default(self, line):
@@ -2849,11 +2960,6 @@ class CaaSPOrch(CmdBase):
         '''Run the bootstrap orchestration.'''
         self._run_orchestration(DEFAULT_ORCHESTRATION, line)
 
-    def do_boot_again(self, line):
-        '''Rollback and run the bootstrap orchestration.'''
-        print_iterator(virsh_rollback_for_all(running=True), flush=True)
-        self._run_orchestration(DEFAULT_ORCHESTRATION, line)
-
     def do_update(self, line):
         '''
         Run the update orchestration.
@@ -2862,17 +2968,16 @@ class CaaSPOrch(CmdBase):
         flag in all the machines in the cluster
         '''
         kwargs = get_assign_from_str(line)
+
         prepare = True
-
-        self._prepare_orchestration(DEFAULT_ORCHESTRATION, line)
-
         if str2bool(kwargs.get('fake', 'false')):
             self._run_orchestration('update_set_needed', '',
                                     prepare=prepare, post_orch_rcs=False)
             prepare = False
 
         log.info('updating the cluster')
-        self._run_orchestration('update', line, prepare=prepare, pre_orch_rcs=False)
+        self._run_orchestration(
+            'update', line, prepare=prepare, pre_orch_rcs=False)
 
     def do_update_set_needed(self, line):
         '''Set the update-is-needed flag in all the machines in the cluster.'''
@@ -2881,7 +2986,8 @@ class CaaSPOrch(CmdBase):
     def do_rm(self, line):
         '''Run the removal orchestration.'''
         if len(line) < 1:
-            raise CommandError('the removal orchestration needs some node(s) as an argument')
+            raise CommandError(
+                'the removal orchestration needs some node(s) as an argument')
 
         nodes = line.split(' ')
         ids = list(get_machine_ids(nodes).values())
@@ -2895,7 +3001,8 @@ class CaaSPOrch(CmdBase):
     def do_add(self, line):
         '''Run the addition orchestration.'''
         if len(line) < 1:
-            raise CommandError('the addition orchestration needs some node(s) as an argument')
+            raise CommandError(
+                'the addition orchestration needs some node(s) as an argument')
 
         nodes = line.split(' ')
         ids = list(get_machine_ids(nodes).values())
@@ -2976,8 +3083,8 @@ class CaaSPCopies(CmdBase):
         vm = line_comps[0]
         full_vm = tf_find_for(vm)
 
-        orig = None
-        dest = None
+        orig = ''
+        dest = ''
         container = None
         if len(line_comps) > 1:
             orig_expr = line_comps[1]
@@ -3169,7 +3276,8 @@ class CaaSPTest(CmdBase):
                 log.info('FAILED: %s', test)
 
     def postloop(self):
-        log.info('%s tests passed, %d failed', len(self.passed), len(self.failed))
+        log.info('%s tests passed, %d failed',
+                 len(self.passed), len(self.failed))
 
 
 ###################
@@ -3197,13 +3305,17 @@ class CaaSPDevel(CmdBase):
         def guess_dir(maybe_dirs, descr):
             log.info('devel: %s directory not provided: guessing...', descr)
             for maybe_dir in maybe_dirs:
-                maybe_dir_abs = os.path.abspath(os.path.join(CURR_DIR, maybe_dir))
+                maybe_dir_abs = os.path.abspath(
+                    os.path.join(CURR_DIR, maybe_dir))
                 if os.path.exists(maybe_dir_abs):
-                    log.info('devel: %s directory found at %s', descr, maybe_dir_abs)
+                    log.info('devel: %s directory found at %s',
+                             descr, maybe_dir_abs)
                     return maybe_dir_abs
 
-            log.critical('devel: %s directory neither provided nor found', descr)
-            raise Exception('{} directory neither provided nor found'.format(descr))
+            log.critical(
+                'devel: %s directory neither provided nor found', descr)
+            raise Exception(
+                '{} directory neither provided nor found'.format(descr))
 
         if line:
             kwargs = get_assign_from_str(line)
@@ -3225,10 +3337,12 @@ class CaaSPDevel(CmdBase):
         if args.copy_manifests:
             log.debug('devel: will copy the manifests')
             if not args.manifests_dir:
-                args.manifests_dir = guess_dir(MAYBE_DIRS_MANIFESTS, 'manifests')
+                args.manifests_dir = guess_dir(
+                    MAYBE_DIRS_MANIFESTS, 'manifests')
 
             if args.manifests_branch:
-                log.info('devel: will use manifests branch "%s"', args.manifests_branch)
+                log.info('devel: will use manifests branch "%s"',
+                         args.manifests_branch)
 
         local_devel = os.path.abspath(os.path.join(
             os.getcwd(), os.path.basename(args.tf_devel_profile)))
@@ -3297,11 +3411,11 @@ class CaaSPDevel(CmdBase):
             if not args.salt_dir:
                 raise CommandError('Salt code has not been found/specified')
 
-            if branch == ['reset', 'checkout', 'current', 'worktree']:
+            if branch in ['reset', 'checkout', 'current', 'worktree']:
                 log.info('setting the Salt branch to the current working tree')
                 args.salt_branch = None
             else:
-                log.info('setting the Salt branch to %s', branch)
+                log.info('setting the Salt branch to "%s"', branch)
                 args.salt_branch = branch
 
         elif component in ['manifest', 'manifests']:
@@ -3312,11 +3426,12 @@ class CaaSPDevel(CmdBase):
             if not args.manifests_dir:
                 raise CommandError('manifests has not been found/specified')
 
-            if branch == ['reset', 'checkout', 'current', 'worktree']:
-                log.info('setting the manifests branch to the current working tree')
+            if branch in ['reset', 'checkout', 'current', 'worktree']:
+                log.info(
+                    'setting the manifests branch to the current working tree')
                 args.manifests_branch = None
             else:
-                log.info('setting the manifests branch to %s', branch)
+                log.info('setting the manifests branch to "%s"', branch)
                 args.manifests_branch = branch
 
 ###################
@@ -3399,8 +3514,7 @@ class CaaSP(CmdBase):
         admin_ip = admin_ips[0]
         dash_url = 'https://{admin_ip}'.format(**locals())
         log.info('Opening %s', dash_url)
-        cmd = 'xdg-open {dash_url}'.format(**locals())
-        run_interactive(cmd)
+        run_interactive('xdg-open {dash_url}'.format(**locals()))
 
     def do_kubectl(self, line):
         '''Run kubectl with the cluster.'''
@@ -3444,7 +3558,10 @@ if __name__ == '__main__':
     caasp_cmd = CaaSP()
 
     if not args.skip_rc_files:
-        caasp_cmd.try_rc_files(CAASP_RC_FILES + CAASP_RC_FILES_ABS, directory=CURR_DIR)
+        log.debug('trying to load RC files')
+        caasp_cmd.try_rc_files(
+            CAASP_RC_FILES + CAASP_RC_FILES_ABS, directory=CURR_DIR)
+        caasp_cmd.try_rc_files(CAASP_RC_FILES, directory=get_work_dir())
 
     if len(args.args) > 0 and args.commands_pre:
         caasp_cmd.command_line_args(args.args)

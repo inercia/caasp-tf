@@ -30,6 +30,11 @@ variable "repo_admin_url" {
   description = "an extra repository to add to the Admin node"
 }
 
+variable "repo_updates_url" {
+  default     = ""
+  description = "an extra repository for updates"
+}
+
 variable "repo_nodes_url" {
   default     = ""
   description = "an extra repository to add to the Nodes"
@@ -107,43 +112,6 @@ resource "null_resource" "copy_resources_admin" {
   }
 }
 
-###################################
-# Copy manifests to the admin node
-###################################
-
-# try to copy the manifests as soon as we can...
-
-resource "null_resource" "copy_manifests" {
-  # this will not be run at all when manifests_dir==''
-  count      = "${signum(length(var.manifests_dir))}"
-  depends_on = ["null_resource.copy_resources_admin"]
-
-  connection {
-    host     = "${libvirt_domain.admin.network_interface.0.addresses.0}"
-    password = "${var.password}"
-  }
-
-  provisioner "remote-exec" {
-    inline = [
-      "/tmp/caasp/caaspctl rw enable",
-      "rm -rf /usr/share/caasp-container-manifests",
-      "echo Will copy ${pathexpand(var.manifests_dir)}",
-    ]
-  }
-
-  provisioner "file" {
-    source      = "${pathexpand(var.manifests_dir)}"
-    destination = "/usr/share/caasp-container-manifests"
-  }
-
-  provisioner "remote-exec" {
-    inline = [
-      "chmod 755 /usr/share/caasp-container-manifests/*.sh",
-      "sh /usr/share/caasp-container-manifests/admin-node-setup.sh",
-    ]
-  }
-}
-
 ##############################
 # copy resources to the nodes
 ##############################
@@ -181,7 +149,57 @@ resource "null_resource" "copy_resources_nodes" {
 }
 
 resource "null_resource" "copy_resources" {
-  depends_on = ["null_resource.copy_resources_admin", "null_resource.copy_resources_nodes"]
+  depends_on = ["null_resource.copy_resources_admin", "null_resource.copy_resources_nodes", "null_resource.updates"]
+}
+
+###################################
+# Add updates
+###################################
+
+# notes:
+# - it is necessary to install updates BEFORE the filesystem becomes RW
+# - this does not reboot the machines
+
+resource "null_resource" "updates_admin" {
+  # this will not be run at all when update_repo==''
+  count      = "${signum(length(var.repo_updates_url))}"
+  depends_on = ["null_resource.copy_resources_admin"]
+
+  connection {
+    host     = "${libvirt_domain.admin.network_interface.0.addresses.0}"
+    password = "${var.password}"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "systemctl disable transactional-update",
+      "/tmp/caasp/caaspctl zypper addrepo --enable --refresh --type yast2 --priority 99 ${var.repo_updates_url} updates",
+      "/usr/sbin/transactional-update cleanup dup salt",
+    ]
+  }
+}
+
+resource "null_resource" "updates_nodes" {
+  # this will not be run at all when update_repo==''
+  count      = "${length(var.repo_updates_url) == 0 ? 0 : var.nodes_count}"
+  depends_on = ["null_resource.copy_resources_nodes"]
+
+  connection {
+    host     = "${element(libvirt_domain.node.*.network_interface.0.addresses.0, count.index)}"
+    password = "${var.password}"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "systemctl disable transactional-update",
+      "/tmp/caasp/caaspctl zypper addrepo --enable --refresh --type yast2 --priority 99 ${var.repo_updates_url} updates",
+      "/usr/sbin/transactional-update cleanup dup salt",
+    ]
+  }
+}
+
+resource "null_resource" "updates" {
+  depends_on = ["null_resource.updates_admin", "null_resource.updates_nodes"]
 }
 
 ##########################
@@ -224,6 +242,43 @@ resource "null_resource" "add_zypper_repo" {
   depends_on = ["null_resource.add_zypper_repo_admin", "null_resource.add_zypper_repo_nodes"]
 }
 
+###################################
+# Copy manifests to the admin node
+###################################
+
+# try to copy the manifests as soon as we can...
+
+resource "null_resource" "copy_manifests" {
+  # this will not be run at all when manifests_dir==''
+  count      = "${signum(length(var.manifests_dir))}"
+  depends_on = ["null_resource.copy_resources_admin", "null_resource.updates"]
+
+  connection {
+    host     = "${libvirt_domain.admin.network_interface.0.addresses.0}"
+    password = "${var.password}"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "/tmp/caasp/caaspctl rw enable",
+      "rm -rf /usr/share/caasp-container-manifests",
+      "echo Will copy ${pathexpand(var.manifests_dir)}",
+    ]
+  }
+
+  provisioner "file" {
+    source      = "${pathexpand(var.manifests_dir)}"
+    destination = "/usr/share/caasp-container-manifests"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod 755 /usr/share/caasp-container-manifests/*.sh",
+      "sh /usr/share/caasp-container-manifests/admin-node-setup.sh",
+    ]
+  }
+}
+
 ##########################
 # Copy Salt to admin node
 ##########################
@@ -231,7 +286,7 @@ resource "null_resource" "add_zypper_repo" {
 resource "null_resource" "copy_salt" {
   # this will not be run at all when salt_dir==''
   count      = "${signum(length(var.salt_dir))}"
-  depends_on = ["null_resource.copy_resources_admin"]
+  depends_on = ["null_resource.copy_resources_admin", "null_resource.updates"]
 
   connection {
     host     = "${libvirt_domain.admin.network_interface.0.addresses.0}"
@@ -257,7 +312,7 @@ resource "null_resource" "copy_salt" {
 
 data "template_file" "role_grain" {
   count    = "${var.nodes_count}"
-  template = "roles: [ $${roles} ]"
+  template = "roles: [ $${roles} ]\n"
 
   vars {
     roles = "${lookup(var.roles, count.index, var.default_role)}"
@@ -396,6 +451,7 @@ resource "null_resource" "activate" {
   count = "${var.activate ? 1 : 0}"
 
   depends_on = [
+    "null_resource.updates",
     "null_resource.copy_manifests",
     "null_resource.copy_salt",
     "null_resource.copy_resources_admin",
@@ -409,6 +465,7 @@ resource "null_resource" "activate" {
 
   provisioner "remote-exec" {
     inline = [
+      "/tmp/caasp/caaspctl rw enable",
       "/tmp/caasp/caaspctl activate",
     ]
   }
@@ -423,6 +480,7 @@ resource "null_resource" "registry" {
 
   depends_on = [
     "null_resource.copy_resources_admin",
+    "null_resource.updates",
     "null_resource.copy_manifests",
     "null_resource.copy_salt",
     "null_resource.autorun",
@@ -458,6 +516,7 @@ resource "null_resource" "orchestrate" {
 
   depends_on = [
     "null_resource.copy_resources_admin",
+    "null_resource.updates",
     "null_resource.copy_manifests",
     "null_resource.copy_salt",
     "null_resource.autorun",
@@ -476,6 +535,7 @@ resource "null_resource" "orchestrate" {
   # nodes_count+2 (because of "ca" and "admin") keys to be accepted
   provisioner "remote-exec" {
     inline = [
+      "/tmp/caasp/caaspctl rw enable",
       "/tmp/caasp/caaspctl minions accept ${var.nodes_count + 2}",
       "/tmp/caasp/caaspctl orch boot",
     ]
