@@ -1,6 +1,7 @@
 devel enable
 
 cluster tfvars images-devel
+cluster tfvars tests/elasticsearch.tfvars
 
 stage apply
 print ###############################################
@@ -31,6 +32,9 @@ ssh nodes "systemctl restart salt-minion"
 # (this will abort the script if it fails)
 ssh nodes "ping -c1 dashboard"
 
+# PSP disallows privileged containers
+salt set_pillar addons:psp false
+
 # run the regular bootstrap orchestration
 salt wait
 orch boot
@@ -38,3 +42,5 @@ sleep 30
 
 cluster snapshot stage="post-orch", description="Orchestration has been run"
 sleep 30
+
+orch kubeconfig

@@ -32,8 +32,6 @@ cluster rollback
 sleep 30
 
 cluster flush
-cluster tfvars no-refresh
-cluster tfvars local
 cluster tfvars images-devel
 cluster tfvars tests/addition-stage-2
 

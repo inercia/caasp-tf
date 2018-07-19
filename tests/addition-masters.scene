@@ -1,6 +1,8 @@
+
 devel enable
 
 cluster tfvars images-devel
+cluster tfvars tests/addition-masters.tfvars
 
 stage apply
 print ###############################################
@@ -38,3 +40,19 @@ sleep 30
 
 cluster snapshot stage="post-orch", description="Orchestration has been run"
 sleep 30
+
+stage add-masters
+print ###############################################
+print # adding masters
+print ###############################################
+cluster rollback
+
+# now we can add some roles to the unassigned nodes
+ssh run caasp-node-4 echo -e 'roles: [ kube-master, etcd ]' > /etc/salt/grains
+ssh run caasp-node-5 echo -e 'roles: [ kube-master, etcd ]' > /etc/salt/grains
+
+sleep 10
+ctl salt sync
+sleep 10
+
+orch boot

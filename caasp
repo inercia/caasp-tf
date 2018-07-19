@@ -18,6 +18,7 @@ import traceback
 from cmd import Cmd
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from tempfile import NamedTemporaryFile
 from threading import Timer
 
 if sys.version_info <= (3, 0):
@@ -189,8 +190,62 @@ ORCH_PREPARE_CAASPCTL_CMDS = [
     'pillar guess_dynamic'
 ]
 
+K8S_DASHBOARD_HELM_CHART = 'stable/kubernetes-dashboard'
+K8S_DASHBOARD_PORT = 8443
+K8S_DASHBOARD_NAMESPACE = 'kube-system'
+K8S_DASHBOARD_USER = 'cluster-admin'
+
 # add the 'ca' and 'admin' Salt minions to the number of keys to wait for
 SALT_KEYS_EXTRA_WAIT = 2
+
+# directory for docker registry certificates
+REGISTRY_CERTS_DIR = os.path.join(CURR_DIR, 'registry')
+
+# configuration used for generating the certificates
+REGISTRY_CERTS_CFG = '''
+[req]
+prompt                      = no
+req_extensions              = v3_req
+distinguished_name          = req_distinguished_name
+[ req_distinguished_name ]
+countryName                 = US
+stateOrProvinceName         = Somewhere
+localityName                = Somewhere
+organizationName            = SUSE
+commonName                  = {hostname}
+[ v3_req ]
+basicConstraints            = CA:FALSE
+keyUsage                    = nonRepudiation, digitalSignature, keyEncipherment
+subjectAltName              = @alt_names
+[alt_names]
+DNS.1                       = {hostname}.local
+DNS.2                       = {hostname}
+DNS.3                       = {registry_hostname}
+IP.1                        = {ip}
+'''
+
+REGISTRY_PORT = 5000
+REGISTRY_DOCKER_IMAGE = 'registry'
+REGISTRY_DOCKER_IMAGE_TAG = 2
+
+SCRIPT_REGISTRY_CERTS = '''
+openssl genrsa -out "{ca_key}" 4096
+openssl req -new -x509 -days 1826 -key "{ca_key}" -out "{ca_crt}" -config "{cnf}"
+
+openssl genrsa -out "{reg_key}" 2048
+openssl req -new -key "{reg_key}" -out "{reg_csr}" -subj "/CN={hostname}" -config "{cnf}"
+openssl x509 -req -CA "{ca_crt}" -CAkey "{ca_key}" -CAcreateserial -in "{reg_csr}" -out "{reg_crt}" -days 365 -extensions v3_req -extfile "{cnf}"
+'''
+
+REGISTRY_DOCKER_CMD = '''
+docker run -d -p {registry_port}:{registry_port} \
+  --restart=always --name registry \
+  -v {registry_certs_dir}:/certs \
+  -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/{basename_reg_crt} \
+  -e REGISTRY_HTTP_TLS_KEY=/certs/{basename_reg_key} \
+  -e REGISTRY_STORAGE_DELETE_ENABLED=true \
+  {container_registry}:{container_registry_tag}
+'''
 
 # RC files that are automatically loaded on startup
 # can be used for doing some actions or setting default values (ie, 'devel enable')
@@ -409,6 +464,22 @@ devel_group.add_argument('--tf-devel-profile',
                          default=DEFAULT_TF_DEVEL_PROFILE,
                          help='Terraform development profile (.tf) file')
 
+reg_group = parser.add_argument_group(
+    title='Registry',
+    description='Local Docker registry')
+
+reg_group.add_argument('--reg-cert-dir',
+                       dest='reg_certs_dir',
+                       metavar='DIR',
+                       default=REGISTRY_CERTS_DIR,
+                       help='directory for the regstry certificates')
+reg_group.add_argument('--reg-hostname',
+                       dest='reg_hostname',
+                       metavar='HOSTNAME',
+                       default='registry.com',
+                       help='exported registry name')
+
+
 commands_group = parser.add_argument_group(
     title='Commands processing',
     description='How commands are processed from command line or from the loop')
@@ -468,8 +539,8 @@ files_group = parser.add_argument_group(
 files_group.add_argument('--kubeconfig',
                          dest='kubeconfig',
                          metavar='FILE',
-                         default='kubeconfig',
-                         help='use this kubeconfig file when downlaoding it from the cluster')
+                         default=os.environ.get('KUBECONFIG', 'kubeconfig'),
+                         help='local kubeconfig (downloaded from the Admin Node after orchestrating)')
 files_group.add_argument('--kubeconfig-remote',
                          dest='DEFAULT_KUBECONFIG_REM',
                          metavar='FILE',
@@ -546,6 +617,19 @@ def reset_loglevel(level):
         handler.setLevel(level)
 
 
+def get_local_ip_for(remote_ip='10.255.255.255'):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # doesn't even have to be reachable
+        s.connect((remote_ip, 1))
+        IP = s.getsockname()[0]
+    except:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
+
+
 def value_to_native(val):
     if isinstance(val, str):
         try:
@@ -565,6 +649,32 @@ def value_to_native(val):
             return val[1:-1]
 
     return val
+
+
+def which(program):
+    def is_exe(fpath):
+        return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+
+    fpath, fname = os.path.split(program)
+    if fpath:
+        if is_exe(program):
+            return program
+    else:
+        for path in os.environ["PATH"].split(os.pathsep):
+            exe_file = os.path.join(path, program)
+            if is_exe(exe_file):
+                return exe_file
+
+    return None
+
+
+def get_regular_container(name):
+    for line in run('docker ps'):
+        fields = re.split('\s{2,}', line.strip())
+        cid = fields[0]
+        cname = fields[-1]
+        if name in cname:
+            return cid
 
 
 def notify(body='', summary='CaaSP', icon=None):
@@ -662,7 +772,7 @@ class cd:
 
 
 def run(cmd, sudo=False, password=None, timeout=None):
-    ''' Execute a command '''
+    ''' Execute a command, yielding the stdout lines '''
     assert(isinstance(cmd, str))
 
     if sudo:
@@ -708,6 +818,7 @@ def print_iterator(it, **kwargs):
     if it:
         for line in it:
             print(line, end='', **kwargs)
+
 
 ####################################################################
 # Terraform
@@ -1064,11 +1175,44 @@ def tf_vms_ips(vms):
 
 
 def tf_vms_nodes(vms=None):
-    ''' Get a map with all the nodes. '''
+    ''' Get a map with all the nodes and their IPs. '''
     vms = vms or tf_load_state()
     assert(isinstance(vms, dict))
 
-    return {name: ip for name, ip in vms.items() if re.search(get_nodes_regex(), name)}
+    # Get the regular expression used for identifying nodes
+    if args.vm_nodes_regex:
+        return args.vm_nodes_regex
+
+    try:
+        prefix = tf_get_extra_output('prefix')
+    except Exception as e:
+        log.debug('could not get prefix from terraform state file: %s', e)
+        prefix = args.vm_prefix
+
+    regex = prefix + VM_NODES_REGEX_SUFFIX
+
+    return {name: ip for name, ip in vms.items()
+            if re.search(regex, name)}
+
+
+def tf_vms_admin():
+    ''' Get a tuple with the admin node's name and IP '''
+    if args.vm_admin:
+        return args.vm_admin
+
+    try:
+        prefix = tf_get_extra_output('prefix')
+    except Exception as e:
+        log.debug('could not get prefix from terraform state file: %s', e)
+        prefix = args.vm_prefix
+
+    admin_name = prefix + VM_ADMIN_SUFFIX
+
+    admin_ips = tf_vms_ip_for(admin_name)
+    if not admin_ips:
+        raise InvalidMachineError('cannot find IP for the Admin Node')
+
+    return (admin_name, admin_ips[0])
 
 
 def tf_find_for(vm, vms=None):
@@ -1204,14 +1348,17 @@ def run_rsync(src, vm, dst, timeout=None, **kwargs):
 
     exclude = kwargs.get('exclude', EXCLUDE_ARGS + EXCLUDE_BINS_ARGS)
 
-    vms = tf_load_state()
-    vm_name = tf_find_for(vm, vms=vms)
-    dst_addrs = tf_vms_ip_for(vm_name, vms=vms)
-    if not dst_addrs:
-        raise SSHException(
-            'could not find a an address for {vm}'.format(**locals()))
-
-    dst_addr = dst_addrs[0]
+    if is_ip(vm):
+        dst_addr = vm
+    else:
+        vms = tf_load_state()
+        vm_name = tf_find_for(vm, vms=vms)
+        dst_addrs = tf_vms_ip_for(vm_name, vms=vms)
+        if not dst_addrs:
+            raise SSHException('could not find a an address for {vm}'.format(
+                **locals()))
+        else:
+            dst_addr = dst_addrs[0]
 
     ssh_cmd = 'ssh ' + SSH_ARGS
 
@@ -1253,14 +1400,14 @@ def run_caaspctl(vm, cmd):
 
 def run_caaspctl_admin(cmd):
     assert(isinstance(cmd, str))
-    yield from run_caaspctl(get_admin_name(), cmd)
+    yield from run_caaspctl(tf_vms_admin()[0], cmd)
 
 
 def wait_ssh(vm=None, timeout=CONTAINER_START_TIMEOUT):
     '''
     Wait until we can ssh/scp into a machine
     '''
-    vm = vm or get_admin_name()
+    vm = vm or tf_vms_admin()[0]
     timeout_limit = datetime.now() + timedelta(seconds=timeout)
     while datetime.now() <= timeout_limit:
         try:
@@ -1280,7 +1427,7 @@ def wait_container(cont, vm=None, timeout=CONTAINER_START_TIMEOUT):
     Wait for a container in the Admin node
     If the Admin Node is not available (ie, not reachable), we will insist
     '''
-    vm = vm or get_admin_name()
+    vm = vm or tf_vms_admin()[0]
     timeout_limit = datetime.now() + timedelta(seconds=timeout)
     cmd = 'cont wait ' + cont
     while datetime.now() <= timeout_limit:
@@ -1313,32 +1460,6 @@ def run_ssh_all(cmd, **kwargs):
     ''' Run a command in all the VMs in the cluster '''
     assert(isinstance(cmd, str))
     map_all_vms_par(run_ssh_cmd, cmd=cmd, **kwargs)
-
-
-def get_admin_name():
-    if args.vm_admin:
-        return args.vm_admin
-
-    try:
-        prefix = tf_get_extra_output('prefix')
-    except Exception as e:
-        log.debug('could not get prefix from terraform state file: %s', e)
-        prefix = args.vm_prefix
-
-    return prefix + VM_ADMIN_SUFFIX
-
-
-def get_nodes_regex():
-    if args.vm_nodes_regex:
-        return args.vm_nodes_regex
-
-    try:
-        prefix = tf_get_extra_output('prefix')
-    except Exception as e:
-        log.debug('could not get prefix from terraform state file: %s', e)
-        prefix = args.vm_prefix
-
-    return prefix + VM_NODES_REGEX_SUFFIX
 
 
 def get_machine_id(vm):
@@ -1378,6 +1499,17 @@ def get_cid(vm, name):
             return mid
 
     raise InvalidMachineError('could not find container-id for {}'.format(vm))
+
+
+def sync_hwtime():
+    '''
+    Synchronize the clock between the VMs and the Host
+
+    This is specially important after suspend/resume operations,
+    as this can lead to some certificates beeing invalid.
+    '''
+    run_ssh_all('/sbin/hwclock --hctosys')
+
 
 ####################################################################
 # VMs managements: resume/pause, snapshots...
@@ -1675,41 +1807,45 @@ def copy_enable(**kwargs):
 def copy_to_admin(**kwargs):
     '''Perform all the copies necessary to the admin node.'''
     log.info('copy: copying control scripts and files to the Admin node')
-    vm = get_admin_name()
+    admin_name, admin_ip = tf_vms_admin()
+    assert is_ip(admin_ip)
 
     for src, dst in DEFAULT_COPIES['admin']:
         log.debug('copy: copying %s to %s', src, dst)
         src = _to_rsync_dir(os.path.abspath(src))
         dst = _to_rsync_dir(dst)
         try:
-            for line in run_rsync(src, vm, dst):
+            for line in run_rsync(src, admin_name, dst):
                 if args.debug:
                     yield line
         except SSHException as e:
-            log.error('copy: could not copy %s to %s: %s', src, vm, e)
+            log.error('copy: could not copy %s to %s: %s', src, admin_name, e)
 
 
 def copy_to_admin_code(skip_reboot=False, **kwargs):
     '''Perform all the copies necessary to the admin node.'''
     log.debug('copy: copying files to the Admin node')
-    vm = get_admin_name()
+    admin_name, admin_ip = tf_vms_admin()
 
     if args.copy_salt_code and args.salt_dir:
-        yield from copy_code_to(args.salt_dir, args.salt_branch, DEFAULT_SALT_REM, vm, 'Salt')
+        yield from copy_code_to(args.salt_dir, args.salt_branch,
+                                DEFAULT_SALT_REM, admin_name, 'Salt')
 
     if args.copy_manifests and args.manifests_dir:
-        diffs = get_differences(args.manifests_dir, vm, DEFAULT_MANIFESTS_REM)
+        diffs = get_differences(
+            args.manifests_dir, admin_name, DEFAULT_MANIFESTS_REM)
         if any(x > 0 for x in diffs.values()):
             log.info('copy: detected differences in the manifests: %s', diffs)
-            yield from copy_code_to(args.manifests_dir, args.manifests_branch, DEFAULT_MANIFESTS_REM, vm, 'manifests')
-            yield from run_ssh_cmd(get_admin_name(), 'sh {}'.format(ADMIN_NODE_SETUP))
+            yield from copy_code_to(args.manifests_dir, args.manifests_branch,
+                                    DEFAULT_MANIFESTS_REM, admin_name, 'manifests')
+            yield from run_ssh_cmd(admin_name, 'sh {}'.format(ADMIN_NODE_SETUP))
 
             if skip_reboot:
                 log.warn(
                     'copy: skipping reboot. Manifests will not take effect...')
             else:
                 log.info('copy: rebooting the Admin machine')
-                yield from virsh_reboot(get_admin_name())
+                yield from virsh_reboot(admin_name)
                 time.sleep(10)
                 log.info('copy: waiting until the Salt Master is back')
                 yield from wait_container('salt')
@@ -1816,7 +1952,7 @@ def install_rpms_in_all(**kwargs):
 
 def get_kubeconfig():
     yield from run_caaspctl_admin(CAASPCTL_GEN_KUBECONFIG)
-    yield from copy_file_from(vm=get_admin_name(),
+    yield from copy_file_from(vm=tf_vms_admin()[0],
                               src=args.DEFAULT_KUBECONFIG_REM,
                               dst=args.kubeconfig)
 
@@ -1829,6 +1965,265 @@ def remove_kubeconfig():
 def set_pillar(key, value):
     ''' Set some pillar value (ie, api:server:external_fqdn) '''
     yield from run_caaspctl_admin(CAASPCTL_SET_PILLAR.format(**locals()))
+
+
+########################
+# registry
+########################
+
+def _reg_gen_certs(hostname=None, ip=None):
+    ca_crt = os.path.join(args.reg_certs_dir, 'ca.pem')
+    ca_key = os.path.join(args.reg_certs_dir, 'ca-key.pem')
+    ca_csr = os.path.join(args.reg_certs_dir, 'ca.csr')
+
+    reg_crt = os.path.join(args.reg_certs_dir, 'registry.pem')
+    reg_key = os.path.join(args.reg_certs_dir, 'registry-key.pem')
+    reg_csr = os.path.join(args.reg_certs_dir, 'registry.csr')
+
+    registry_hostname = args.reg_hostname
+    port = REGISTRY_PORT
+
+    if not os.path.exists(args.reg_certs_dir):
+        log.debug('Creating directory %s for registry`s certificates',
+                  args.reg_certs_dir)
+        os.makedirs(args.reg_certs_dir)
+
+    log.debug('Removing old certificates')
+    for filename in [reg_key, reg_crt, reg_csr]:
+        if os.path.exists(filename):
+            log.debug('Removing %s', filename)
+            os.remove(filename)
+
+    if not hostname:
+        hostname = socket.gethostname()
+
+    vms = tf_load_state()
+    if not vms:
+        raise CommandError('no VMs found')
+
+    if not ip:
+        random_vm = list(vms.items())[0]
+        random_vm_ip = random_vm[1]
+        ip = get_local_ip_for(random_vm_ip)
+        if not ip:
+            raise CommandError('could not guess default interface IP')
+        log.debug('Using %s as the local IP in the certificates', ip)
+
+    with NamedTemporaryFile(mode='w+', suffix='.cnf') as ntf:
+        cnf = ntf.name
+        contents = REGISTRY_CERTS_CFG.format(**locals())
+        ntf.write(contents)
+        ntf.flush()
+
+        log.info('Generating Certificates in %s', args.reg_certs_dir)
+        try:
+            cmd = SCRIPT_REGISTRY_CERTS.format(**locals())
+            log.debug('using script: %s', cmd)
+            for line in run(cmd):
+                yield line
+        except Exception as e:
+            log.error('command "%s" failed: %s', cmd, e)
+
+        log.debug('cert: dumping information:')
+        cmd = 'openssl x509 -in "{reg_crt}" -text -noout'.format(**locals())
+        for line in run(cmd):
+            log.debug('certificate: %s', line)
+
+        log.info('Done. Certificates stored at %s', args.reg_certs_dir)
+
+    log.info('Copying registry CA to the nodes')
+    remote_dir = '/etc/docker/certs.d/{registry_hostname}:{port}/ca.crt'.format(
+        **locals())
+
+    for vm, vm_ip in vms.items():
+        yield from run_ssh_cmd(vm, 'mkdir -p `dirname {remote_dir}`'.format(**locals()))
+        yield from copy_file_to(ca_crt, vm, dst=remote_dir)
+        yield from run_ssh_cmd(vm, 'caaspctl etchosts add {registry_hostname} {ip}'.format(**locals()))
+
+
+def _reg_del_certs():
+    ca_crt = os.path.join(args.reg_certs_dir, 'ca.pem')
+    ca_key = os.path.join(args.reg_certs_dir, 'ca-key.pem')
+    ca_csr = os.path.join(args.reg_certs_dir, 'ca.csr')
+
+    reg_crt = os.path.join(args.reg_certs_dir, 'registry.pem')
+    reg_key = os.path.join(args.reg_certs_dir, 'registry-key.pem')
+    reg_csr = os.path.join(args.reg_certs_dir, 'registry.csr')
+
+    log.debug('Removing old certificates')
+    for filename in [reg_key, reg_crt, reg_csr, ca_crt, ca_key, ca_csr]:
+        if os.path.exists(filename):
+            log.debug('Removing %s', filename)
+            os.remove(filename)
+
+def _reg_refresh_nodes(ip=None):
+    registry_hostname = args.reg_hostname
+
+    vms = tf_load_state()
+    if not vms:
+        raise CommandError('no VMs found')
+
+    if not ip:
+        random_vm = list(vms.items())[0]
+        random_vm_ip = random_vm[1]
+        ip = get_local_ip_for(random_vm_ip)
+        if not ip:
+            raise CommandError('could not guess interface IP')
+        log.debug('Using %s as the local IP in the certificates', ip)
+
+    log.info('Updating registry references in the nodes')
+    for vm, vm_ip in vms.items():
+        yield from run_ssh_cmd(vm, 'caaspctl etchosts del {registry_hostname} ; caaspctl etchosts add {registry_hostname} {ip}'.format(**locals()))
+
+
+def registry_start():
+    '''
+    Initialize the certificates and start the registry
+    '''
+    cid = get_regular_container(REGISTRY_DOCKER_IMAGE)
+    if cid:
+        log.error('the registry is already running')
+        return
+
+    reg_crt = os.path.join(args.reg_certs_dir, 'registry.pem')
+    reg_key = os.path.join(args.reg_certs_dir, 'registry-key.pem')
+
+    if not os.path.exists(reg_key):
+        yield from _reg_gen_certs()
+        if not os.path.exists(reg_key):
+            raise CommandError(
+                'no certificate found at {reg_key}'.format(**locals()))
+
+    log.info('Starting the registry')
+    registry_port = REGISTRY_PORT
+    registry_certs_dir = args.reg_certs_dir
+    basename_reg_crt = os.path.basename(reg_crt)
+    basename_reg_key = os.path.basename(reg_key)
+    container_registry = REGISTRY_DOCKER_IMAGE
+    container_registry_tag = REGISTRY_DOCKER_IMAGE_TAG
+    cmd = REGISTRY_DOCKER_CMD.format(**locals())
+    yield from run(cmd)
+
+
+def registry_stop():
+    '''
+    Stop the registry
+    '''
+    cid = get_regular_container(REGISTRY_DOCKER_IMAGE)
+    if cid:
+        yield from run('docker stop {cid}'.format(cid=cid))
+        yield from run('docker rm {cid}'.format(cid=cid))
+    else:
+        log.info('No registry detected.')
+
+    _reg_del_certs()
+
+
+def registry_refresh():
+    '''
+    Refresh the registry
+    '''
+    yield from _reg_refresh_nodes()
+    sync_hwtime()
+
+
+def registry_pull(image_name, registry='localhost', port=REGISTRY_PORT):
+    '''
+    Pull an image from the Docker registry and import
+    it to the local registry
+    '''
+    reg_image_name = '{registry}/{image_name}'.format(**locals())
+    reg_image_name_port = '{registry}:{port}/{image_name}'.format(**locals())
+
+    log.info('Pulling %s', image_name)
+    yield from run('docker pull "{}"'.format(image_name))
+
+    log.debug('Getting the hash for image %s', image_name)
+    cmd = "docker images | grep " + image_name + \
+        " | grep latest | awk '{ print $3 }'"
+    output = list(run(cmd))
+    image_hash = output[0].strip()
+
+    log.info('Tagging %s as %s', image_hash, reg_image_name)
+    yield from run('docker tag {image_hash} {reg_image_name_port}'.format(**locals()))
+
+    log.info('Pushing to %s', reg_image_name_port)
+    yield from run('docker push {reg_image_name_port}'.format(**locals()))
+
+    log.info('Removing tag %s', reg_image_name_port)
+    yield from run('docker rmi {reg_image_name_port}'.format(**locals()))
+
+
+def registry_import(image_name, image_hash=None, registry='localhost', port=REGISTRY_PORT):
+    '''
+    Import an existing image to the local registry
+    '''
+    reg_image_name = '{registry}/{image_name}'.format(**locals())
+    reg_image_name_port = '{registry}:{port}/{image_name}'.format(**locals())
+
+    if not image_hash:
+        name, tag = image_name.split(':')
+        log.debug('Getting the hash for image %s', name)
+        cmd = "docker images | grep " + name + " | grep " + tag + " | awk '{ print $3 }'"
+        output = list(run(cmd))
+        image_hash = output[0].strip()
+
+    log.info('Tagging %s as %s', image_hash, reg_image_name_port)
+    yield from run('docker tag {image_hash} {reg_image_name_port}'.format(**locals()))
+
+    log.info('Pushing to %s', reg_image_name_port)
+    yield from run('docker push {reg_image_name_port}'.format(**locals()))
+
+    log.info('Removing tag %s', reg_image_name_port)
+    yield from run('docker rmi {reg_image_name_port}'.format(**locals()))
+
+
+def registry_rmi(name):
+    '''
+    remove an image from the local registry
+    '''
+    port = REGISTRY_PORT
+    url = 'https://127.0.0.1:{port}/v2/{name}/tags/list'.format(**locals())
+    output = list(run("curl -s --no-proxy '' -k " + url))
+    log.debug('output from %s: %s', name, output)
+
+    import json
+    contents = json.loads(str(output[0]))
+    log.debug('tags in the registry for %s: %s', name, contents)
+    if 'tags' in contents:
+        for tag in contents['tags']:
+            log.debug('getting digest for %s', tag)
+
+            digest = ''
+            url = 'https://127.0.0.1:{port}/v2/{name}/manifests/{tag}'.format(
+                **locals())
+            for line in run('curl -k -v --no-proxy "" -H "Accept:application/vnd.docker.distribution.manifest.v2+json" ' + url + ' 2>&1'):
+                if 'docker-content-digest' in line:
+                    line_comps = line.split(':')
+                    digest = line_comps[-1].strip()
+
+            if not digest:
+                log.error('could not determine digest for %s', tag)
+                continue
+            else:
+                log.debug('digest seems to be %s', digest)
+
+            log.debug('removing "%s:%s/%s" in local registry',
+                      name, tag, digest)
+            url = 'https://127.0.0.1:{port}/v2/{name}/manifests/{digest}'.format(
+                **locals())
+            yield from run('curl -X DELETE -s -o /dev/null --no-proxy "" -H "Accept:application/vnd.docker.distribution.manifest.v2+json" -k ' + url)
+    else:
+        log.error('no tags in catalog for "%s"', name)
+
+
+def registry_catalog():
+    '''
+    Dump the registry catalog contents
+    '''
+    url = 'https://127.0.0.1:5000/v2/_catalog'
+    yield from run("curl -s --no-proxy '' -k " + url)
+
 
 ####################################################################
 # Command-line processing
@@ -2217,6 +2612,35 @@ class CmdBase(Cmd):
             log.debug('Setting command line argument: "%s" = "%s"', k, v)
             args.__dict__[k] = v
 
+    def check_kubeconfig(self):
+        if not os.path.exists(args.kubeconfig):
+            log.info('kubeconfig does not seem to exist: generating...')
+            try:
+                print_iterator(get_kubeconfig())
+            except SSHException as e:
+                log.error('kubeconfig generation error: %s', e)
+                raise CommandError('could not obtain a kubeconfig')
+            except KeyboardInterrupt as e:
+                log.error('[Interrupted]')
+                return
+
+        if not os.path.exists(args.kubeconfig):
+            raise CommandError('could not find a kubeconfig')
+
+    def check_helm(self):
+        helm_path = which('helm')
+        if not helm_path:
+            raise CommandError('no helm executable found')
+        else:
+            log.debug('helm is installed at %s', helm_path)
+
+    def check_kubectl(self):
+        kubectl_path = which('kubectl')
+        if not kubectl_path:
+            raise CommandError('no kubectl executable found')
+        else:
+            log.debug('kubectl is installed at %s', kubectl_path)
+
 ###################
 # SSH
 ###################
@@ -2265,10 +2689,11 @@ class CaaSPSSH(CmdBase):
     def do_admin(self, line):
         '''Run a command in the Admin node or start a interactive shell'''
         with self._operation():
+            admin_name, admin_ip = tf_vms_admin()
             if line:
-                print_iterator(run_ssh_cmd(get_admin_name(), line))
+                print_iterator(run_ssh_cmd(admin_name, line))
             else:
-                run_ssh_session(get_admin_name())
+                run_ssh_session(admin_name)
 
     def do_nodes(self, line):
         '''Run a command in the nodes (ie, all machines except the admin node) VMs.'''
@@ -2479,6 +2904,7 @@ class CaaSPCluster(CmdBase):
                              post_msg='Cluster refreshed',
                              icon='reload'):
             print_iterator(tf_refresh())
+            sync_hwtime()
 
     def do_ips(self, line):
         '''Get the list of VMs IPs.'''
@@ -2650,6 +3076,7 @@ class CaaSPCluster(CmdBase):
             # make sure the VMs are running: otherwise, refresh will fail
             map_all_vms_par(virsh_resume_for_vm)
             print_iterator(tf_refresh())
+            sync_hwtime()
 
     def do_power_on(self, line):
         '''
@@ -2661,6 +3088,7 @@ class CaaSPCluster(CmdBase):
                              icon='up'):
             map_all_vms_par(virsh_power_on_for_vm)
             print_iterator(tf_refresh())
+            sync_hwtime()
 
     def do_resume(self, line):
         '''
@@ -2672,6 +3100,7 @@ class CaaSPCluster(CmdBase):
                              icon='forward'):
             map_all_vms_par(virsh_resume_for_vm)
             print_iterator(tf_refresh())
+            sync_hwtime()
 
     def do_reboot(self, line):
         '''
@@ -2723,19 +3152,20 @@ class CaaSPSalt(CmdBase):
         '''
         with self._operation():
             print_iterator(copy_to_admin())
-            run_ssh_session(get_admin_name(), 'caaspctl salt ' + line)
+            run_ssh_session(tf_vms_admin()[0], 'caaspctl salt ' + line)
 
     def do_sync(self, line):
         '''Perform a Salt synchronization.'''
         with self._operation():
             print_iterator(copy_to_admin())
             print_iterator(run_caaspctl_admin(CAASPCTL_SALT_SYNC))
+            sync_hwtime()
 
     def do_attach(self, line):
         '''Attach to the Salt Master output.'''
         with self._operation():
             print_iterator(copy_to_admin())
-            run_ssh_session(get_admin_name(), 'caaspctl salt attach')
+            run_ssh_session(tf_vms_admin()[0], 'caaspctl salt attach')
 
     def do_wait(self, line):
         '''
@@ -2879,7 +3309,7 @@ class CaaSPCtl(CmdBase):
     def do_enter(self, line):
         with self._operation():
             print_iterator(copy_to_admin())
-            run_ssh_session(get_admin_name(), args.vm_caaspctl)
+            run_ssh_session(tf_vms_admin()[0], args.vm_caaspctl)
 
     def do_sh(self, line):
         with self._operation():
@@ -2887,14 +3317,107 @@ class CaaSPCtl(CmdBase):
             if line:
                 print_iterator(run_caaspctl_admin(line))
             else:
+                admin_name, admin_ip = tf_vms_admin()
                 log.debug('Starting %s in the Admin node %s',
-                          args.vm_caaspctl, get_admin_name())
-                run_ssh_session(get_admin_name(), args.vm_caaspctl)
+                          args.vm_caaspctl, admin_name)
+                run_ssh_session(admin_name, args.vm_caaspctl)
 
+
+###################
+# Registry
+###################
+
+
+class CaaSPRegistry(CmdBase):
+
+    prompt = prompt('caasp:registry')
+
+    def do_start(self, line):
+        '''
+        Start a docker registry
+
+        > registry start
+        '''
+        log.info('registry: starting')
+        print_iterator(registry_start())
+        log.info(
+            'registry: the registry is up and running at port %d...', REGISTRY_PORT)
+
+    def do_stop(self, line):
+        '''
+        Stop the docker registry
+
+        Usage:
+
+        > registry stop
+        '''
+        log.info('registry: stopping')
+        print_iterator(registry_stop())
+        log.info('registry: the registry is stopped...')
+
+    def do_refresh(self, line):
+        '''
+        Refresh the node's vieew of the local registry
+
+        Usage:
+
+        > registry refresh
+        '''
+        log.info('registry: refreshing')
+        print_iterator(registry_refresh())
+
+    def do_pull(self, line):
+        '''
+        Pull an image from the Docker registry to the local registry
+
+        Usage:
+
+        > registry pull alpine
+        '''
+        line_comps = line.split(' ')
+        if len(line_comps) != 1:
+            raise CommandError('invalid number of arguments')
+
+        name = line_comps[0]
+
+        log.info('registry: pulling "%s" to the local registry', name)
+        print_iterator(registry_pull(name))
+        log.info('registry: image "%s" pulled to the local registry...', name)
+
+    def do_import(self, line):
+        '''
+        Import an image to the local registry
+
+        Usage:
+
+        > registry import alpine 2c9365b8a85d
+        '''
+        line_comps = line.split(' ')
+
+        log.info('registry: importing %s', line_comps[0])
+        print_iterator(registry_import(*line_comps))
+        log.info('registry: image %s imported...', line_comps[0])
+
+    def do_rmi(self, line):
+        '''
+        Remove an image from the local registry
+        '''
+        if not line:
+            raise CommandError('invalid number of arguments')
+
+        log.info('registry: removing %s', line)
+        print_iterator(registry_rmi(line))
+
+    def do_catalog(self, line):
+        '''
+        '''
+        log.info('registry: dumping catalog')
+        print_iterator(registry_catalog())
 
 ###################
 # Orchestrations
 ###################
+
 
 class CaaSPOrch(CmdBase):
 
@@ -3100,7 +3623,7 @@ class CaaSPCopies(CmdBase):
         if orig:
             print_iterator(copy_file_to(orig, full_vm, dest, container))
         else:
-            if full_vm == get_admin_name():
+            if full_vm == tf_vms_admin()[0]:
                 print_iterator(copy_to_admin())
                 print_iterator(copy_to_admin_code())
             else:
@@ -3447,6 +3970,7 @@ class CaaSP(CmdBase):
 
     def __init__(self):
         super().__init__()
+        self.registry = CaaSPRegistry(self)
         self.cluster = CaaSPCluster(self)
         self.ssh = CaaSPSSH(self)
         self.salt = CaaSPSalt(self)
@@ -3462,6 +3986,10 @@ class CaaSP(CmdBase):
             sub_cmd.onecmd(line)
         else:
             sub_cmd.cmdloop()
+
+    def do_registry(self, line):
+        '''Docker registry commands.'''
+        self._subcommand(self.registry, line)
 
     def do_cluster(self, line):
         '''Manage the cluster.'''
@@ -3505,36 +4033,120 @@ class CaaSP(CmdBase):
 
     def do_dashboard(self, line):
         '''
-        Open the Dashboard in a web browser
+        Open the CaaSP Dashboard in a web browser
         '''
-        admin_ips = tf_vms_ip_for(get_admin_name())
-        if not admin_ips:
-            raise InvalidMachineError('cannot find IP for the Admin Node')
-
-        admin_ip = admin_ips[0]
+        admin_name, admin_ip = tf_vms_admin()
         dash_url = 'https://{admin_ip}'.format(**locals())
         log.info('Opening %s', dash_url)
         run_interactive('xdg-open {dash_url}'.format(**locals()))
 
+    def do_helm(self, line):
+        '''
+        Initialize Helm
+        '''
+        admin_name, admin_ip = tf_vms_admin()
+        log.info('Initializing Helm...')
+        print_iterator(run_ssh_cmd(admin_name, 'helm init --client-only'))
+        log.info('Updating Helm repos...')
+        print_iterator(run_ssh_cmd(admin_name, 'helm repo update'))
+        log.info(
+            'Helm has been initialized... you can do things like `helm search mongo` now')
+
+    def do_k8s_dashboard(self, line):
+        '''
+        Install and run the k8s dashboard
+
+        NOTE: this requires
+
+          * a local Helm client
+          * Helm to have been initialized
+        '''
+        name = 'kubernetes-dashboard'
+        port = K8S_DASHBOARD_PORT
+        chart = K8S_DASHBOARD_HELM_CHART
+        ns = K8S_DASHBOARD_NAMESPACE
+        user = K8S_DASHBOARD_USER
+        admin_name, admin_ip = tf_vms_admin()
+
+        log.info('Checking if the dashboard is already installed...')
+        self.check_kubeconfig()
+        self.check_kubectl()
+        self.check_helm()
+
+        def get_dash_pod(**lkwargs):
+            pod = None
+            try:
+                log.debug('Getting the k8s dashboard pod...')
+                cmd = "kubectl get pods --namespace {ns} -l 'app={name}'".format(
+                    **lkwargs)
+                cmd += " -o jsonpath='{.items[0].metadata.name}'"
+                for line in run(cmd):
+                    pod = line
+                    break
+
+                if 'kubernetes-dashboard' not in pod:
+                    pod = None
+            except Exception as e:
+                log.error('Could not get k8s dashboard pod: %s', e)
+                pod = None
+
+            if pod:
+                log.debug('pod: %s', pod)
+
+            return pod
+
+        pod = get_dash_pod(**locals())
+        if not pod:
+            # TODO: we should check Helm has been initialized
+            log.info('The dashboard was not installed... installing now')
+            cmd = "helm install --replace --name {name} {chart}".format(
+                **locals())
+            cmd += " --namespace {ns}".format(**locals())
+            cmd += " --set rbac.create=true"
+            print_iterator(run(cmd))
+
+            pod = get_dash_pod(**locals())
+            if not pod:
+                raise CommandError('no dashboard pod could be found')
+
+        # 'caaspctl orch kubeconfig' generated a "admin-user" account and "cluster-admin" role
+        # we "describe" that service account for getting the "token:"
+        # see https://github.com/kubernetes/dashboard/wiki/Creating-sample-user
+        log.info('Getting bearer token (used for logging into the Dashboard)')
+        cmd = "kubectl -n {ns} describe secret $(kubectl -n {ns} get secret | grep {user} | cut -f1 -d' ') | grep token:".format(
+            **locals())
+        output = list(run(cmd))
+        log.info('%s', output[0])
+
+        log.info('Waiting for the Dashboard to be ready...')
+        cmd = 'kubectl rollout status --namespace {ns} deployment/{name}'.format(
+            **locals())
+        print_iterator(run(cmd))
+
+        k8s_dash_url = 'https://127.0.0.1:{port}'.format(**locals())
+
+        log.info('Kubernetes dashboard will be available at %s in a few seconds...',
+                 k8s_dash_url)
+        cmd = 'kubectl --namespace {ns} port-forward {pod} {port}:8443 --pod-running-timeout=10m'.format(
+            **locals())
+        try:
+            while True:
+                # the kubectl port-forward breaks lots of times, so loop
+                print_iterator(run(cmd))
+                log.debug('... port-forward stopped: restarting')
+        except KeyboardInterrupt:
+            pass
+
     def do_kubectl(self, line):
         '''Run kubectl with the cluster.'''
         print_iterator(copy_to_admin())
-        if not os.path.exists(args.kubeconfig):
-            try:
-                print_iterator(get_kubeconfig())
-            except SSHException as e:
-                log.error('kubeconfig generation error: %s', e)
-                return
-            except KeyboardInterrupt as e:
-                log.error('[Interrupted]')
-                return
 
-        if os.path.exists(args.kubeconfig):
-            log.error('no kubeconfig available')
-        else:
-            cmd = 'kubectl --kubeconfig={} {}'.format(args.kubeconfig, line)
-            if run_interactive(cmd) != 0:
-                log.error('kubectl failed')
+        self.check_kubeconfig()
+        self.check_kubectl()
+
+        cmd = 'kubectl --kubeconfig={} {}'.format(args.kubeconfig, line)
+        if run_interactive(cmd) != 0:
+            log.error('kubectl failed')
 
     def do_version(self, line):
         '''Print the version.'''

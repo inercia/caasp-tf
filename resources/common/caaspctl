@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 
 import argparse
+import csv
 import glob as gb
 import json
-import csv
 import logging
 import os
 import os.path as op
@@ -17,6 +17,9 @@ import time
 import traceback
 from cmd import Cmd
 from datetime import datetime, timedelta
+from tempfile import NamedTemporaryFile
+
+import yaml
 
 try:
     # for Python 2.x
@@ -25,7 +28,6 @@ except ImportError:
     # for Python 3.x
     from io import StringIO
 
-import yaml
 
 # logging format
 # https://docs.python.org/2/library/logging.html#logrecord-attributes
@@ -41,8 +43,6 @@ ORCH_ADDITION = 'addition'
 ORCH_OPTS = "-l debug --force-color --hard-crash"
 
 # some key container (partial) names
-CONTAINER_REGISTRY = "registry"
-CONTAINER_REGISTRY_TAG = "2"
 CONTAINER_SALT_MASTER = "salt-master"
 CONTAINER_SALT_API = "salt-api"
 CONTAINER_VELUM = "velum-dashboard"
@@ -100,13 +100,20 @@ SCRIPT_ACTIVATION = '''
 '''
 
 # commands for generating a valid kubeconfig
+# the kubeconfig will be pointed to one of the multiple masters BUT the haproxy
+# there send our connection to some of the real apiservers. kubectl will refuse to
+# talk to this server as the certificate presented does not match the real
+# IP address.
+# the only solution is to use --insecure-skip-tls-verify
+# if some dday we include all the IPs in the certfificate, we could use:
+#  kubectl config set-cluster default-cluster --embed-certs=true --server="{apiserver}" --certificate-authority="{ca_crt}"
 SCRIPT_KUBECONFIG = '''
   openssl genrsa -out {cert_admin_dir}/admin.key 2048
   openssl req -new -key {cert_admin_dir}/admin.key -out {cert_admin_dir}/admin.csr -subj "/CN={cert_admin_user}/O=system:masters"
   openssl x509 -req -in {cert_admin_dir}/admin.csr -CA {ca_crt} -CAkey {ca_key} -CAcreateserial -out {cert_admin_dir}/admin.crt -days 365
   rm -f {cert_admin_dir}/admin.csr
 
-  kubectl config set-cluster default-cluster --embed-certs=true --server="{apiserver}" --certificate-authority="{ca_crt}"
+  kubectl config set-cluster default-cluster --server="{apiserver}" --insecure-skip-tls-verify
   kubectl config set-credentials "{cert_admin_user}" --embed-certs=true --certificate-authority="{ca_crt}" --client-key="{cert_admin_dir}/admin.key" --client-certificate="{cert_admin_dir}/admin.crt"
   kubectl config set-context default-system --cluster=default-cluster --user="{cert_admin_user}"
   kubectl config use-context default-system
@@ -120,6 +127,30 @@ mount -o remount,rw /
 
 # the admin user in kubernetes (used for generating certificates/kubeconfig)
 K8S_ADMIN_USER = "cluster-admin"
+
+K8S_ADMIN_USER_YAML = '''
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {user}
+  namespace: kube-system
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: admin-user
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: {user}
+  namespace: kube-system
+'''
+
 
 # RC files that are automatically loaded on startup
 # can be used for doing some actions or setting default values
@@ -324,7 +355,8 @@ def execute(cmd, sudo=False, password=None):
             cmd = line
 
         log.debug('Running "%s"', cmd)
-        popen = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, universal_newlines=True)
+        popen = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.PIPE, universal_newlines=True)
         for stdout_line in iter(popen.stdout.readline, ""):
             yield stdout_line
 
@@ -406,7 +438,7 @@ def get_regular_container(name):
     for line in docker_ps_out.split('\n'):
         fields = re.split('\s{2,}', line.strip())
         cid = fields[0]
-        cname = fields[5]
+        cname = fields[-1]
         if name in cname:
             return cid
 
@@ -452,7 +484,8 @@ def get_container_logs(name):
         c = get_cid(name)
     except Exception as e:
         log.debug('could not find container %s: %s', name, e)
-        raise ContainerNotFoundException('could not find container {name}'.format(name=name))
+        raise ContainerNotFoundException(
+            'could not find container {name}'.format(name=name))
 
     cmd = 'docker logs {}'.format(c)
     for line in execute(cmd):
@@ -491,7 +524,8 @@ def exec_in_container(name, cmd, wait=False):
         c = None
 
     if not c:
-        raise ContainerNotFoundException('could not find container {name}'.format(name=name))
+        raise ContainerNotFoundException(
+            'could not find container {name}'.format(name=name))
 
     cmd = 'docker exec {} {}'.format(c, cmd)
     log.debug('docker: executing in "%s" command "%s"', c, cmd)
@@ -506,7 +540,8 @@ def restart_container(name):
         c = get_cid(name)
     except Exception as e:
         log.debug('could not find container %s: %s', name, e)
-        raise ContainerNotFoundException('could not find container {name}'.format(**locals()))
+        raise ContainerNotFoundException(
+            'could not find container {name}'.format(**locals()))
 
     log.info('Restarting container %s', name)
     if c != None:
@@ -554,10 +589,12 @@ def wait_for_db(db=None, timeout=CONTAINER_START_TIMEOUT):
         except:
             pass
 
-        log.info("Waiting for database {} ({} left)...".format(db, timeout_limit - datetime.now()))
+        log.info("Waiting for database {} ({} left)...".format(
+            db, timeout_limit - datetime.now()))
         time.sleep(5)
 
-    raise ContainerWaitTimeout('timeout while waiting for database {}'.format(db))
+    raise ContainerWaitTimeout(
+        'timeout while waiting for database {}'.format(db))
 
 
 def pillar_db_insert(key, value, **kwargs):
@@ -627,6 +664,8 @@ def get_salt_where_from(name):
     try:
         return {
             '*': '*',
+            'all': '*',
+            'cluster': '*',
             'ca': 'G@roles:ca',
             'admin': 'G@roles:admin',
             'kube-master': 'G@roles:kube-master',
@@ -656,12 +695,17 @@ def exec_in_salt(cmd,
 
     debug_level = 'critical' if not debug else 'debug'
     color_arg = '--force-color' if color else '--no-color'
-    compound_arg = " -C '{}'".format(compound) if compound else ''
 
-    cmd_args = '{compound_arg} --log-level={debug_level} {salt_args} '.format(**locals())
+    if compound:
+        compound_arg = " -C '{}'".format(get_salt_where_from(compound))
+    else:
+        compound_arg = ''
+
+    cmd_args = '{compound_arg} --log-level={debug_level} {salt_args} '.format(
+        **locals())
 
     if out:
-        cmd_args += " --out={}".format(out)
+        cmd_args += ' --out={} --out-indent=4'.format(out)
     elif newlines:
         cmd_args += ' --out=newline_values_only '
 
@@ -731,7 +775,8 @@ def wait_for_num_keys_accepted(num_keys, timeout=CONTAINER_START_TIMEOUT):
                  num_keys, num_accepted, str(timeout_limit - datetime.now()))
         time.sleep(5)
 
-    raise ContainerWaitTimeout('timeout waiting for {} to be accepted'.format(num_keys))
+    raise ContainerWaitTimeout(
+        'timeout waiting for {} to be accepted'.format(num_keys))
 
 
 SALT_AVAIL_SYNC = ['all', 'engines', 'grains', 'beacons', 'utils', 'returners',
@@ -751,29 +796,31 @@ def salt_sync(what='all'):
 
 def grain_set(where, key, value):
     log.info("Setting grain %s=%s in %s", key, value, where)
-    where = get_salt_where_from(where)
     cmd = 'grains.set "{}" "{}"'.format(key, value)
     for line in exec_in_salt(cmd, compound=where, wait=True):
         yield line
 
+
 def grain_get(where, key):
     log.info("Getting grain %s in %s", key, where)
-    where = get_salt_where_from(where)
     cmd = 'grains.get {}'.format(key)
     for line in exec_in_salt(cmd, compound=where, wait=True):
         yield line
 
+
 def grain_ls(where):
     log.info("Listing grains (in '%s')", where)
     cmd = 'grains.ls'
-    for line in exec_in_salt(cmd, compound=get_salt_where_from(where), wait=True):
+    for line in exec_in_salt(cmd, compound=where, wait=True):
         yield line
 
 
 def grain_items(where):
     log.info("Listing grains (in '%s')", where)
     cmd = 'grains.items'
-    for line in exec_in_salt(cmd, compound=get_salt_where_from(where), wait=True):
+    for line in exec_in_salt(cmd, compound=where,
+                             wait=True,
+                             out='yaml'):
         yield line
 
 #########################
@@ -796,7 +843,8 @@ def get_role_nodenames(role, timeout=CONTAINER_START_TIMEOUT):
             for line in grain_get(role, 'nodename'):
                 yield line
         except Exception as e:
-            log.warning('get-role-nodenames: while waiting for nodename for %s: %s', role, e)
+            log.warning(
+                'get-role-nodenames: while waiting for nodename for %s: %s', role, e)
 
         log.debug("get-role-nodenames: waiting for result for {} ({} left)...".format(
             role, timeout_limit - datetime.now()))
@@ -812,7 +860,7 @@ def get_role_ip(role, timeout=CONTAINER_START_TIMEOUT):
     while datetime.now() <= timeout_limit:
         try:
             for line in exec_in_salt('network.interface_ip eth0',
-                                     compound=get_salt_where_from(role.strip()),
+                                     compound=role.strip(),
                                      color=False, wait=True):
                 res = line.strip()  # return only the first line
                 if is_ip(res):
@@ -967,126 +1015,11 @@ def save_orch_csv(orch_lines):
             writer.writerow(line)
 
 
-########################
-# registry
-########################
-
-# TMP_REGISTRY_CNF=/tmp/registry-openssl.cnf
-#
-# CA_CRT="$REGISTRY_CERTS_DIR/ca.pem"
-# CA_KEY="$REGISTRY_CERTS_DIR/ca-key.pem"
-# CA_CSR="$REGISTRY_CERTS_DIR/ca.csr"
-#
-# REG_CRT="$REGISTRY_CERTS_DIR/registry.pem"
-# REG_KEY="$REGISTRY_CERTS_DIR/registry-key.pem"
-# REG_CSR="$REGISTRY_CERTS_DIR/registry.csr"
-#
-#
-# reg_gen_certs() {
-#   mkdir -p "$REGISTRY_CERTS_DIR"
-#   rm -f "$REG_KEY" "$REG_CRT" "$REG_CSR"
-#
-#   if [ -z "$REGISTRY_IP" ] ; then
-#     REGISTRY_IP=$(default_iface_ip)
-#     [ -n "$REGISTRY_IP" ] || abort "could not guess default interface IP"
-#   fi
-#
-#   log "Generating openssl config"
-#   echo "[req]" >$TMP_REGISTRY_CNF
-#   echo "prompt                      = no" >>$TMP_REGISTRY_CNF
-#   echo "req_extensions              = v3_req" >>$TMP_REGISTRY_CNF
-#   echo "distinguished_name          = req_distinguished_name" >>$TMP_REGISTRY_CNF
-#   echo "[ req_distinguished_name ]" >>$TMP_REGISTRY_CNF
-#   echo "countryName                 = US" >>$TMP_REGISTRY_CNF
-#   echo "stateOrProvinceName         = Somewhere" >>$TMP_REGISTRY_CNF
-#   echo "localityName                = Somewhere" >>$TMP_REGISTRY_CNF
-#   echo "organizationName            = SUSE" >>$TMP_REGISTRY_CNF
-#   echo "commonName                  = $REGISTRY_HOSTNAME" >>$TMP_REGISTRY_CNF
-#   echo "[ v3_req ]" >>$TMP_REGISTRY_CNF
-#   echo "basicConstraints            = CA:FALSE" >>$TMP_REGISTRY_CNF
-#   echo "keyUsage                    = nonRepudiation, digitalSignature, keyEncipherment" >> $TMP_REGISTRY_CNF
-#   echo "subjectAltName              = @alt_names" >>$TMP_REGISTRY_CNF
-#   echo "[alt_names]" >>$TMP_REGISTRY_CNF
-#   echo "DNS.1                       = $REGISTRY_HOSTNAME.local" >>$TMP_REGISTRY_CNF
-#   echo "DNS.2                       = $REGISTRY_HOSTNAME" >>$TMP_REGISTRY_CNF
-#   echo "IP.1                        = $REGISTRY_IP" >>$TMP_REGISTRY_CNF
-#
-#   log "Generating CA"
-#   openssl genrsa -out "$CA_KEY" 4096
-#   openssl req -new -x509 -days 1826 \
-#     -key "$CA_KEY" -out "$CA_CRT" \
-#     -config "$TMP_REGISTRY_CNF"
-#
-#   log "Generating registry's private key"
-#   openssl genrsa -out "$REG_KEY" 2048
-#
-#   log "Generating registry's certificate signing request (CSR)"
-#   openssl req -new \
-#     -key "$REG_KEY" -out "$REG_CSR" \
-#     -subj "/CN=$REGISTRY_HOSTNAME" \
-#     -config "$TMP_REGISTRY_CNF"
-#
-#   log "Signing registry's CSR with CA key"
-#   openssl x509 -req \
-#     -CA "$CA_CRT" -CAkey "$CA_KEY" \
-#     -CAcreateserial \
-#     -in "$REG_CSR" -out "$REG_CRT" \
-#     -days 365 \
-#     -extensions v3_req \
-#     -extfile "$TMP_REGISTRY_CNF"
-#
-#   rm -f "$TMP_REGISTRY_CNF"
-#
-#   log "Dumping certificate information:"
-#   openssl x509 -in "$REG_CRT" -text -noout
-#   log "Done. Certificates stored at $REGISTRY_CERTS_DIR"
-# }
-#
-# reg_dump_catalog() {
-#   log "Dumping registry catalog"
-#   CURL_ARGS=
-#   if [ -f "$CA_CRT" ] ; then
-#     CURL_ARGS="$CURL_ARGS --cacert $CA_CRT"
-#     CATALOG_URL="https://$REGISTRY/v2/_catalog"
-#   else
-#     CATALOG_URL="http://$REGISTRY/v2/_catalog"
-#   fi
-#   curl $CURL_ARGS "$CATALOG_URL"
-# }
-#
-# reg_start() {
-#   [ -f "$REG_KEY" ] || $CAASPCTL certs
-#   [ -f "$REG_KEY" ] || abort "no certificate found at $REG_KEY"
-#
-#   log "Starting the registry"
-#   docker run -d -p $REGISTRY_PORT:$REGISTRY_PORT \
-#     --restart=always --name registry \
-#     -v $REGISTRY_CERTS_DIR:/certs \
-#     -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/$(basename "$REG_CRT") \
-#     -e REGISTRY_HTTP_TLS_KEY=/certs/$(basename "$REG_KEY") \
-#     $CONTAINER_REGISTRY:$CONTAINER_REGISTRY_TAG
-# }
-#
-# reg_import() {
-#   local image_name="$1"
-#
-#   log "Pulling $image_name"
-#   docker pull "$image_name"
-#
-#   local image_hash=$(docker images | grep "$image_name" | grep latest | awk '{ print $3 }')
-#
-#   log "Tagging $image_hash as $REGISTRY/$image_name"
-#   docker tag "$image_hash" "$REGISTRY/$image_name"
-#
-#   log "Pushing $REGISTRY/$image_name"
-#   docker push "$REGISTRY/$image_name"
-#
-#   $CAASPCTL registry status
-# }
 
 #########################
 # events parsing
 #########################
+
 
 def parse_orch_by_node(it, filter_orch_last=False):
     '''
@@ -1204,9 +1137,11 @@ def parse_orch_by_node(it, filter_orch_last=False):
             if retcode != 0:
                 # this is an error
                 msg = 'ERROR: ' + actions[0][:20] + '...'
-                add_for_node(node, stage='highstate', name=msg, jid=jid, result=False)
+                add_for_node(node, stage='highstate',
+                             name=msg, jid=jid, result=False)
             else:
-                parse_actions(node, {node: actions.values()}, stage=stage, jid=jid)
+                parse_actions(node, {node: actions.values()},
+                              stage=stage, jid=jid)
 
         elif fun == "runner.state.orchestrate":
             orch_name = data['fun_args'][0]
@@ -1222,13 +1157,15 @@ def parse_orch_by_node(it, filter_orch_last=False):
 
                 if isinstance(step_changes, bool):
                     name = get_name_for_action(step['name'])
-                    parse_action(name, step, orch=orch_name, stage=stage, jid=jid)
+                    parse_action(name, step, orch=orch_name,
+                                 stage=stage, jid=jid)
                 elif isinstance(step_changes, dict):
                     try:
                         orch_steps = step_changes['ret']
                     except (KeyError, TypeError) as e:
                         name = get_name_for_action(step['name'])
-                        parse_action(name, step, orch=orch_name, stage=stage, jid=jid)
+                        parse_action(name, step, orch=orch_name,
+                                     stage=stage, jid=jid)
                     else:
                         for node, actions in orch_steps.items():
                             if not isinstance(actions, dict):
@@ -1327,11 +1264,13 @@ class CmdBase(Cmd):
 
                 if not self.is_interactive():
                     # we are running in batch mode
-                    log.critical(on_color('RED', 'exception catched in batch mode: %s'), e)
+                    log.critical(
+                        on_color('RED', 'exception catched in batch mode: %s'), e)
                     self.abort()
 
                 log.critical(on_color('RED', 'exception catched !!! %s'), e)
-                log.critical(on_color('RED', 'get more details with "traceback".'))
+                log.critical(
+                    on_color('RED', 'get more details with "traceback".'))
 
     def precmd(self, line):
         if line.lstrip().startswith('#'):
@@ -1344,7 +1283,8 @@ class CmdBase(Cmd):
         def sh_replacer(text):
             cmd = text[1:-1]  # remove the ``
             log.debug('replacing %s by shell output', cmd)
-            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True)
+            out = subprocess.check_output(
+                cmd, stderr=subprocess.STDOUT, shell=True)
             return out.decode('utf-8').rstrip()
         line = replace_pattern(r"`.*`", sh_replacer, line)
 
@@ -1383,7 +1323,8 @@ class CmdBase(Cmd):
                 try:
                     self.load_script(maybe_rc_file)
                 except Exception as e:
-                    log.critical('Could not read rc file %s: %s', maybe_rc_file, e)
+                    log.critical('Could not read rc file %s: %s',
+                                 maybe_rc_file, e)
                     sys.exit(1)
 
     def load_script(self, script):
@@ -1497,7 +1438,8 @@ class CmdBase(Cmd):
             raise CommandError('no stage specified')
 
         stage = line
-        log.debug('reached stage "%s" (waiting "%s")s', stage, args.script_begin)
+        log.debug('reached stage "%s" (waiting "%s")s',
+                  stage, args.script_begin)
         if str(stage) == str(args.script_begin):
             log.debug('stage %s reached: unblocking input', args.script_begin)
             self.blocked = False
@@ -1567,7 +1509,7 @@ class CaaSPSalt(CmdBase):
         if len(line_comps) < 2:
             raise CommandError('insufficient arguments')
 
-        where = get_salt_where_from(line_comps[0])
+        where = line_comps[0]
         state = line_comps[1]
 
         cmd_args = ''
@@ -1595,7 +1537,7 @@ class CaaSPSalt(CmdBase):
         if len(line_comps) < 1:
             raise CommandError('insufficient arguments')
 
-        where = get_salt_where_from(line_comps[0])
+        where = line_comps[0]
         cmd_args = line_comps[1:]
 
         print_iterator(salt_sync())
@@ -1723,7 +1665,7 @@ class CaaSPPillar(CmdBase):
 
     def do_set(self, line):
         '''
-        Set a pillar.
+        Set a pillar in the database.
 
         Usage:
 
@@ -1733,7 +1675,8 @@ class CaaSPPillar(CmdBase):
         line_comps = [] if not line else line.split(' ')
 
         if len(line_comps) != 2:
-            raise CommandError('set requires two arguments: the key and the value')
+            raise CommandError(
+                'set requires two arguments: the key and the value')
 
         key, value = line_comps[0].strip(), line_comps[1].strip()
         log.info('Setting the %s to %s', key, value)
@@ -1742,6 +1685,12 @@ class CaaSPPillar(CmdBase):
     def do_load(self, line):
         '''
         Load pillar values from a file
+
+        The file is expected to be formed by lines with with form "<KEY> <VALUE>".
+        For example:
+
+        addons:tiller   true
+        addons:dns      true
 
         Usage:
 
@@ -1777,8 +1726,7 @@ class CaaSPPillar(CmdBase):
         line_comps = [] if not line else line.split(' ')
 
         if len(line_comps) >= 2:
-            key = line_comps[0]
-            where = get_salt_where_from(line_comps[1])
+            key, where = line_comps
             cmd = 'pillar.get {key}'.format(**locals())
         elif len(line_comps) == 1:
             print(line_comps)
@@ -1791,7 +1739,8 @@ class CaaSPPillar(CmdBase):
             cmd = 'pillar.items'.format(**locals())
 
         log.info('Getting %s at %s', key, where)
-        out_it = exec_in_salt(cmd, compound=where, color=True, out='yaml', wait=True)
+        out_it = exec_in_salt(cmd, compound=where,
+                              color=True, out='yaml', wait=True)
         print_iterator(out_it)
 
     def do_db(self, line):
@@ -1853,9 +1802,60 @@ class CaaSPPillar(CmdBase):
         print_iterator(pillar_db_insert('api:server:external_fqdn', master_ip))
 
 
+class CaaSPGrains(CmdBase):
+
+    prompt = prompt('caaspctl:grains')
+
+    def do_set(self, line):
+        '''
+        Set a grain for a node (or group of nodes).
+
+        Usage:
+
+        > grains set 'G@kube-master' nodename master
+        '''
+        line = line.strip()
+        line_comps = [] if not line else line.split(' ')
+
+        if len(line_comps) != 3:
+            raise CommandError(
+                'set requires three arguments: where, key and value')
+
+        where, key, value = line_comps[0].strip(
+        ), line_comps[1].strip(), line_comps[2].strip()
+        log.info('Setting the %s to %s at %s', key, value, where)
+        print_iterator(grain_set(where, key, value))
+
+    def do_get(self, line):
+        '''
+        Get a pillar.
+
+        Usage:
+
+        > grains get ca nodename
+        > grains get ca *
+        '''
+        line = line.strip()
+        line_comps = [] if not line else line.split(' ')
+
+        if len(line_comps) >= 2:
+            where, key = line_comps
+        elif len(line_comps) == 1:
+            where = '*'
+            key = line_comps[0]
+        else:
+            raise CommandError('Invalid number of arguments')
+
+        log.info('Getting %s at %s', key, where)
+        if key.strip() == '*':
+            print_iterator(grain_items(where))
+        else:
+            print_iterator(grain_get(where, key))
+
 ###################
 # logs
 ###################
+
 
 class CaaSPLogs(CmdBase):
 
@@ -1887,11 +1887,14 @@ class CaaSPZypper(CmdBase):
         > zypper addrepo --enable --refresh http://something/updates myrepo
         '''
         log.info('Accepting these vendors: {}'.format(ZYPPER_VENDORS))
-        print_iterator(execute('echo "[main]" > /etc/zypp/vendors.d/vendors.conf'))
-        print_iterator(execute('echo "vendors = {}" >> /etc/zypp/vendors.d/vendors.conf'.format(ZYPPER_VENDORS)))
+        print_iterator(
+            execute('echo "[main]" > /etc/zypp/vendors.d/vendors.conf'))
+        print_iterator(execute(
+            'echo "vendors = {}" >> /etc/zypp/vendors.d/vendors.conf'.format(ZYPPER_VENDORS)))
 
         log.info('Running zypper add-repo %s', line)
-        print_iterator(execute('zypper ar --refresh --no-gpgcheck {}'.format(line)))
+        print_iterator(
+            execute('zypper ar --refresh --no-gpgcheck {}'.format(line)))
         log.info('... repo added.')
 
     def do_removerepo(self, line):
@@ -1949,18 +1952,6 @@ class CaaSPDb(CmdBase):
     def do_wait(self, line):
         log.info('Waiting for database')
         wait_for_db()
-
-###################
-# Minions
-###################
-
-
-class CaaSPRegistry(CmdBase):
-
-    prompt = prompt('caaspctl:registry')
-
-    def default(self, line):
-        log.error('not implemented yet')
 
 ###################
 # Minions
@@ -2092,7 +2083,8 @@ class CaaSPOrch(CmdBase):
         log.info('orchestration: starting "%s"...', orch)
 
         if pillar:
-            orch_args += ' pillar=\'{}\''.format(json.dumps(pillar, separators=(',', ':')))
+            orch_args += ' pillar=\'{}\''.format(
+                json.dumps(pillar, separators=(',', ':')))
 
         if len(orch_args) > 0:
             log.info('orchestration: arguments: %s', orch_args)
@@ -2105,7 +2097,8 @@ class CaaSPOrch(CmdBase):
             for line in exec_salt_runner(cmd, salt_args=ORCH_OPTS):
                 sys.stdout.write(line)
         except Exception as e:
-            raise OrchestrationFailure('orchestration {} failed: {}'.format(orch, e))
+            raise OrchestrationFailure(
+                'orchestration {} failed: {}'.format(orch, e))
         else:
             log.info('orchestration: %s finished', orch)
 
@@ -2140,7 +2133,8 @@ class CaaSPOrch(CmdBase):
         > orch rm 923ac3ef4a554371b2e247e22ef9b0c8
         '''
         if not line:
-            raise CommandError('the removal orchestration needs a node as an argument')
+            raise CommandError(
+                'the removal orchestration needs a node as an argument')
 
         node_id = line.strip()
         pillar = {
@@ -2157,7 +2151,8 @@ class CaaSPOrch(CmdBase):
         > orch add 923ac3ef4a554371b2e247e22ef9b0c8
         '''
         if not line:
-            raise CommandError('the additional orchestration needs a node as an argument')
+            raise CommandError(
+                'the additional orchestration needs a node as an argument')
 
         node_id = line.strip()
         pillar = {
@@ -2304,10 +2299,10 @@ class CaaSP(CmdBase):
         CmdBase.__init__(self)
         self.salt = CaaSPSalt(self)
         self.pillar = CaaSPPillar(self)
+        self.grains = CaaSPGrains(self)
         self.db = CaaSPDb(self)
         self.orch = CaaSPOrch(self)
         self.events = CaaSPEvents(self)
-        self.registry = CaaSPRegistry(self)
         self.etchosts = CaaSPEtcHosts(self)
         self.zypper = CaaSPZypper(self)
         self.minions = CaaSPMinions(self)
@@ -2328,13 +2323,13 @@ class CaaSP(CmdBase):
         '''Salt pillar commands.'''
         self._subcommand(self.pillar, line)
 
+    def do_grains(self, line):
+        '''Salt grains commands.'''
+        self._subcommand(self.grains, line)
+
     def do_db(self, line):
         '''Database commands.'''
         self._subcommand(self.db, line)
-
-    def do_registry(self, line):
-        '''Database commands.'''
-        self._subcommand(self.registry, line)
 
     def do_orch(self, line):
         '''Orchestration commands.'''
@@ -2422,6 +2417,15 @@ class CaaSP(CmdBase):
         except Exception as e:
             log.error('command "%s" failed: %s', cmd, e)
 
+        # see https://github.com/kubernetes/dashboard/wiki/Creating-sample-user
+        log.info('Creating admin user')
+        with NamedTemporaryFile(suffix='.yaml') as ntf:
+            ntf.write(K8S_ADMIN_USER_YAML.format(user=K8S_ADMIN_USER))
+            ntf.flush()
+
+            print_iterator(
+                execute('kubectl apply -f {name}'.format(name=ntf.name)))
+
     def do_rw(self, line):
         '''
         Enable the rw filesystem
@@ -2444,14 +2448,16 @@ class CaaSP(CmdBase):
             # single | 8 |       | Fri 15 Jun 2018 04:36:48 PM CEST | root |         | Snapshot Update       |
             # single | 9 |       | Fri 15 Jun 2018 05:03:42 PM CEST | root |         | Snapshot Update       |
             #
-            scsv = '\n'.join(snapshots[2:])  # create a string, but skip the first two lines
+            # create a string, but skip the first two lines
+            scsv = '\n'.join(snapshots[2:])
             f = StringIO(scsv)
             snapshots_rows = list(csv.reader(f, delimiter='|'))
 
             # take the second field (the snapshot num) of the last snapshot
             last_snapshot_num = int(snapshots_rows[-1][1])
 
-            log.info('Making the FS read-writeable (with snapshot=%d)', last_snapshot_num)
+            log.info('Making the FS read-writeable (with snapshot=%d)',
+                     last_snapshot_num)
             cmd = SCRIP_REMOUNT_RW.format(num=last_snapshot_num)
             log.debug('using script: %s', cmd)
             print_iterator(execute(cmd))
