@@ -19,6 +19,7 @@
 #
 #      - add "PermitTunnel yes" in "/etc/ssh/sshd_config"
 #      - add "PermitRootLogin yes" in "/etc/ssh/sshd_config"
+#      - the "ifconfig" and "brctl" commands
 #      - add your ssh key
 #      - do a "systemctl reload sshd"
 #

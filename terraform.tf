@@ -46,6 +46,12 @@ variable "img" {
   description = "remote URL or local copy (can be used in conjuction with img_url_base) of the image to use."
 }
 
+variable "img_regex" {
+  type        = "string"
+  default     = "SUSE-CaaS-Platform.*-KVM-and-Xen.*x86_64.*Build"
+  description = "regex for selecting the image filename (ie, we will download '<img_url_base>/<img_regex>.qcow2')"
+}
+
 variable "img_refresh" {
   default     = "true"
   description = "Try to get the latest image (true/false)"
@@ -120,7 +126,7 @@ resource "null_resource" "download_caasp_image" {
   count = "${length(var.img_url_base) == 0 ? 0 : 1}"
 
   provisioner "local-exec" {
-    command = "./support/tf/download-image.sh --sudo-virsh '${var.img_sudo_virsh}' --src-base '${var.img_url_base}' --refresh '${var.img_refresh}' --local '${var.img}' --upload-to-img '${var.prefix}_base_${basename(var.img)}' --upload-to-pool '${var.img_pool}' --src-filename '${var.img_src_filename}' ${var.img_down_extra_args}"
+    command = "./support/tf/download-image.sh  --img-regex '${var.img_regex}' --sudo-virsh '${var.img_sudo_virsh}' --src-base '${var.img_url_base}' --refresh '${var.img_refresh}' --local '${var.img}' --upload-to-img '${var.prefix}_base_${basename(var.img)}' --upload-to-pool '${var.img_pool}' --src-filename '${var.img_src_filename}' ${var.img_down_extra_args}"
   }
 }
 
@@ -144,7 +150,7 @@ data "template_file" "admin_cloud_init_user_data" {
   }
 }
 
-resource "libvirt_cloudinit" "admin" {
+resource "libvirt_cloudinit_disk" "admin" {
   name      = "${var.prefix}_admin_cloud_init.iso"
   pool      = "${var.img_pool}"
   user_data = "${data.template_file.admin_cloud_init_user_data.rendered}"
@@ -153,7 +159,7 @@ resource "libvirt_cloudinit" "admin" {
 resource "libvirt_domain" "admin" {
   name      = "${var.prefix}-admin"
   memory    = "${var.admin_memory}"
-  cloudinit = "${libvirt_cloudinit.admin.id}"
+  cloudinit = "${libvirt_cloudinit_disk.admin.id}"
 
   #cpu {
   #  feature {
@@ -204,7 +210,7 @@ data "template_file" "node_cloud_init_user_data" {
   depends_on = ["libvirt_domain.admin"]
 }
 
-resource "libvirt_cloudinit" "node" {
+resource "libvirt_cloudinit_disk" "node" {
   count     = "${var.nodes_count}"
   name      = "${var.prefix}_node_cloud_init_${count.index}.iso"
   pool      = "${var.img_pool}"
@@ -215,7 +221,7 @@ resource "libvirt_domain" "node" {
   count      = "${var.nodes_count}"
   name       = "${var.prefix}-node-${count.index}"
   memory     = "${lookup(var.nodes_memory, count.index, var.default_node_memory)}"
-  cloudinit  = "${element(libvirt_cloudinit.node.*.id, count.index)}"
+  cloudinit  = "${element(libvirt_cloudinit_disk.node.*.id, count.index)}"
   depends_on = ["libvirt_domain.admin"]
 
   disk {

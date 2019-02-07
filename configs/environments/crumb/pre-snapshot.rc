@@ -1,0 +1,2 @@
+# print Temporarily disabling KSM on crumb.arch.suse.de
+# shell ssh root@crumb.arch.suse.de '[ -w /sys/kernel/mm/ksm/run ] && echo 0 > /sys/kernel/mm/ksm/run'

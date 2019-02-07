@@ -22,39 +22,46 @@ sleep 30
 # copies
 ###########################################
 stage copies
-cluster rollback
+cluster rollback vm=admin
 
-devel enable salt=True, manifests=True
+# devel enable salt=True, manifests=True
+# copy admin skip_reboot=True
 
-cluster rollback
-copy admin skip_reboot=True
+### NOTE: we keep a local public.yaml file where the entrypoint is mounted
+###
+### NOTE: this will only work if the manifests in
+###       /usr/share/caasp-container-manifests/manifests/public.yaml
+###       have:
+###
+#   - mountPath: /usr/local/bin/entrypoint.sh
+#     name: openldap-entrypoint
+#     readOnly: True
+#   ...
+#   - name: openldap-entrypoint
+#     hostPath:
+#       path: /usr/share/caasp-container-manifests/config/ldap/entrypoint.sh
+#
+ssh admin caaspctl rw enable
+copy to admin tests/ldap-public.yaml /usr/share/caasp-container-manifests/manifests/public.yaml
 
-### NOTE: this will only work if the manifests
-###       mount entrypoint.sh in /usr/local/bin/entrypoint.sh
+###########################################
+# entrypoint update
+###########################################
+stage copy-entrypoint
+ssh admin caaspctl rw enable
+ssh admin mkdir -p /usr/share/caasp-container-manifests/config/ldap
 copy to admin ../container-images/openldap-image/root/usr/local/bin/entrypoint.sh /usr/share/caasp-container-manifests/config/ldap/
 ssh admin ls -lisa /usr/share/caasp-container-manifests/config/ldap/
 
-### Remove the configuration, so we force the reconfiguration
-ssh admin rm -rf /var/lib/misc/ldap/*  /var/lib/misc/ldap-config/*
+# print !!! Removing LDAP the database/configuration !!!
+# ssh admin rm -rf /var/lib/misc/ldap/*  /var/lib/misc/ldap-config/*
 
 cluster reboot admin wait_for=salt
 sleep 5
 
-stage orch
-###############################################
-# bootstrapping
-###############################################
+print openldap container:
+ssh admin docker ps -a | grep openldap | head -n1 | cut -f1 -d' ' | xargs docker logs -f
 
-# run the regular bootstrap orchestration
-salt wait
-orch boot
-sleep 30
-
-cluster snapshot stage="post-orch", description="Orchestration has been run"
-sleep 30
-
-# sleep 5
-#
 # print Checking ldap logs
 # ctl cont logs ldap
 #

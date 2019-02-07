@@ -1,5 +1,11 @@
-# Steps
+# Remote environments setup
 
+## Some commands that must be available in the remote machine
+
+* ifconfig
+* brctl (bridge-utils)
+* wget
+* mkisofs
 
 ## Configure sshd on the remote end
 
@@ -17,6 +23,13 @@ PermitRootLogin yes
   - At this point you should be able to connect to this machine as root.
   Check you can do it.
 
+Also make sure your ssh key type is allowded in this machine. For example, for `dss`:
+
+```
+PubkeyAcceptedKeyTypes=+ssh-dss
+```
+
+Check the `journalctl` in the remomte end in case of any other failure...
 
 ## Configure ssh locally
 
@@ -70,7 +83,7 @@ virsh pool-autostart default
   - run:
 
 ```
-virsh net-create /dev/stdin <<EOF
+virsh net-define /dev/stdin <<EOF
 <network>
   <name>caasp-net</name>
   <uuid>ad3cc7b4-cc58-4fa1-8dd6-24fc4b8be0c0</uuid>
@@ -89,4 +102,9 @@ virsh net-create /dev/stdin <<EOF
   </ip>
 </network>
 EOF
+
+virsh net-start caasp-net
+virsh net-autostart caasp-net
 ```
+
+

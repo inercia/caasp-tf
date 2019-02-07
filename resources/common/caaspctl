@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import argparse
 import csv
@@ -23,7 +23,7 @@ import yaml
 
 try:
     # for Python 2.x
-    from StringIO import StringIO
+    from io import StringIO
 except ImportError:
     # for Python 3.x
     from io import StringIO
@@ -120,7 +120,7 @@ SCRIPT_KUBECONFIG = '''
 '''
 
 # command for remounting the filesystem in read-write mode
-SCRIP_REMOUNT_RW = '''
+SCRIPT_REMOUNT_RW = '''
 btrfs property set -ts /.snapshots/{num}/snapshot ro false
 mount -o remount,rw /
 '''
@@ -354,11 +354,10 @@ def execute(cmd, sudo=False, password=None):
         else:
             cmd = line
 
-        log.debug('Running "%s"', cmd)
+        log.debug('exec: running "%s"', cmd)
         popen = subprocess.Popen(
             cmd, shell=True, stdout=subprocess.PIPE, universal_newlines=True)
-        for stdout_line in iter(popen.stdout.readline, ""):
-            yield stdout_line
+        yield from iter(popen.stdout.readline, "")
 
         popen.stdout.close()
         return_code = popen.wait()
@@ -373,27 +372,30 @@ def execute_interactive(cmd, sudo=False, password=None):
     if sudo:
         cmd = "echo %s | sudo -S %s" % (password, cmd)
 
-    log.debug('Starting interactive command "%s"', cmd)
+    log.debug('exec: starting interactive command "%s"', cmd)
     return subprocess.call(cmd, shell=True)
 
 
 def execute_now(cmd, strip_nls=True):
-    res = []
-    for line in cmd.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    try:
+        res = []
+        for line in cmd.splitlines():
+            line = line.strip()
+            if not line:
+                continue
 
-        out = str(subprocess.check_output(line, shell=True))
+            out = subprocess.check_output(line, shell=True).decode('utf-8')
+            if strip_nls:
+                out = out.strip('\n')
+
+            res.append(out)
+
         if strip_nls:
-            out = out.strip('\n')
-
-        res.append(out)
-
-    if strip_nls:
-        return ' '.join(res)
-    else:
-        return '\n'.join(res)
+            return ' '.join(res)
+        else:
+            return '\n'.join(res)
+    except Exception as e:
+        log.error("exec: CRITICAL: on execute_now(): " + str(e))
 
 
 #########################
@@ -434,19 +436,19 @@ class ContainerWaitTimeout(Exception):
 
 
 def get_regular_container(name):
-    docker_ps_out = execute_now('docker ps')
-    for line in docker_ps_out.split('\n'):
-        fields = re.split('\s{2,}', line.strip())
-        cid = fields[0]
-        cname = fields[-1]
-        if name in cname:
-            return cid
-
-    return None
+    try:
+        full_cmd = 'docker ps --filter="name=' + name + '" --format "{{.ID}}"'
+        out = execute_now(full_cmd)
+        return str(out).strip()
+    except Exception as e:
+        log.error("CRITICAL: on get_regular_container():  " + str(e))
+        return None
 
 
 def get_container(name):
-    return get_regular_container("k8s_{name}_velum".format(name=name))
+    full_name = "k8s_{name}_velum".format(name=name)
+    log.debug("containers: waiting for {}".format(full_name))
+    return get_regular_container(full_name)
 
 
 def get_cid(name):
@@ -488,9 +490,7 @@ def get_container_logs(name):
             'could not find container {name}'.format(name=name))
 
     cmd = 'docker logs {}'.format(c)
-    for line in execute(cmd):
-        if line:
-            yield line
+    yield from execute(cmd)
 
 
 def wait_for_container(name, timeout=CONTAINER_START_TIMEOUT):
@@ -529,9 +529,7 @@ def exec_in_container(name, cmd, wait=False):
 
     cmd = 'docker exec {} {}'.format(c, cmd)
     log.debug('docker: executing in "%s" command "%s"', c, cmd)
-    for line in execute(cmd):
-        if line:
-            yield line
+    yield from execute(cmd)
 
 
 def restart_container(name):
@@ -569,8 +567,7 @@ def exec_sql_in_db(cmd, **kwargs):
     log.debug('Using password %s', password)
     cmd = 'mysql -uroot -p\'{password}\' -B -t -e "{cmd}" {db}'.format(
         cmd=cmd, db=args.database, password=password)
-    for line in exec_in_container('db', cmd, **kwargs):
-        yield line
+    yield from exec_in_container('db', cmd, **kwargs)
 
 
 def wait_for_db(db=None, timeout=CONTAINER_START_TIMEOUT):
@@ -601,8 +598,7 @@ def pillar_db_insert(key, value, **kwargs):
     ''' Insert a value for a pillar (replacing any previous value) '''
     log.info('Adding pillar "%s"="%s"', key, value)
     cmd = DB_INSERT_PILLAR_CMD.format(**locals())
-    for line in exec_sql_in_db(cmd, **kwargs):
-        yield line
+    yield from exec_sql_in_db(cmd, **kwargs)
 
 #########################
 # /etc/hosts management
@@ -715,37 +711,30 @@ def exec_in_salt(cmd,
     if ignore_stderr:
         cmd = cmd + ' 2>/dev/null'
 
-    for line in exec_in_container('salt', cmd, **kwargs):
-        if line:
-            yield line
+    yield from exec_in_container('salt', cmd, **kwargs)
 
 
 def exec_salt_runner(cmd, **kwargs):
     opts = kwargs.pop('salt_args', ORCH_OPTS)
     cmd = '/usr/bin/salt-run {} --force-color {}'.format(opts, cmd)
-    for line in exec_in_container('salt-master', cmd, **kwargs):
-        yield line
+    yield from exec_in_container('salt-master', cmd, **kwargs)
 
 
 def exec_salt_key(cmd, **kwargs):
     cmd = '/usr/bin/salt-key --force-color ' + cmd
-    for line in exec_in_container('salt-master', cmd, **kwargs):
-        yield line
+    yield from exec_in_container('salt-master', cmd, **kwargs)
 
 
 def get_salt_keys(status='all'):
-    for line in exec_salt_key('-l ' + status, wait=True):
-        yield line
+    yield from exec_salt_key('-l ' + status, wait=True)
 
 
 def get_salt_keys_accepted():
-    for line in get_salt_keys(status='acc'):
-        yield line
+    yield from get_salt_keys(status='acc')
 
 
 def get_salt_keys_rejected():
-    for line in get_salt_keys(status='rej'):
-        yield line
+    yield from get_salt_keys(status='rej')
 
 
 def get_salt_keys_accepted_num():
@@ -762,8 +751,7 @@ def wait_for_num_keys_accepted(num_keys, timeout=CONTAINER_START_TIMEOUT):
         # accept all the pending keys
         # this will fail if no keys have been submitted yet
         try:
-            for line in exec_salt_key('--accept-all --yes'):
-                yield line
+            yield from exec_salt_key('--accept-all --yes')
         except:
             pass
 
@@ -790,22 +778,19 @@ def salt_sync(what='all'):
 
     log.info('Synchronizing %s', what)
     cmd = 'saltutil.sync_{} refresh=True'.format(what)
-    for line in exec_in_salt(cmd, compound='*', wait=True):
-        yield line
+    yield from exec_in_salt(cmd, compound='*', wait=True)
 
 
 def grain_set(where, key, value):
     log.info("Setting grain %s=%s in %s", key, value, where)
     cmd = 'grains.set "{}" "{}"'.format(key, value)
-    for line in exec_in_salt(cmd, compound=where, wait=True):
-        yield line
+    yield from exec_in_salt(cmd, compound=where, wait=True)
 
 
 def grain_get(where, key):
     log.info("Getting grain %s in %s", key, where)
     cmd = 'grains.get {}'.format(key)
-    for line in exec_in_salt(cmd, compound=where, wait=True):
-        yield line
+    yield from exec_in_salt(cmd, compound=where, wait=True)
 
 
 def grain_ls(where):
@@ -830,8 +815,7 @@ def grain_items(where):
 
 def exec_reboot():
     log.info('Rebooting machine')
-    for line in execute('rebootmgrctl reboot'):
-        yield line
+    yield from execute('rebootmgrctl reboot')
 
 
 def get_role_nodenames(role, timeout=CONTAINER_START_TIMEOUT):
@@ -840,8 +824,7 @@ def get_role_nodenames(role, timeout=CONTAINER_START_TIMEOUT):
     timeout_limit = datetime.now() + timedelta(seconds=timeout)
     while datetime.now() <= timeout_limit:
         try:
-            for line in grain_get(role, 'nodename'):
-                yield line
+            yield from grain_get(role, 'nodename')
         except Exception as e:
             log.warning(
                 'get-role-nodenames: while waiting for nodename for %s: %s', role, e)
@@ -1116,7 +1099,7 @@ def parse_orch_by_node(it, filter_orch_last=False):
                 "start_time": "17:12:22.273274"
             },
         '''
-        for action_name, action in actions.items():
+        for action_name, action in list(actions.items()):
             name = get_name_for_action(action_name)
             parse_action(name, action, **kwargs)
 
@@ -1140,14 +1123,14 @@ def parse_orch_by_node(it, filter_orch_last=False):
                 add_for_node(node, stage='highstate',
                              name=msg, jid=jid, result=False)
             else:
-                parse_actions(node, {node: actions.values()},
+                parse_actions(node, {node: list(actions.values())},
                               stage=stage, jid=jid)
 
         elif fun == "runner.state.orchestrate":
             orch_name = data['fun_args'][0]
             return_data = data['return']['data']
-            steps = return_data[return_data.keys()[0]]
-            for step in steps.values():
+            steps = return_data[list(return_data.keys())[0]]
+            for step in list(steps.values()):
                 stage = step.get('__id__', 'unknown')
 
                 try:
@@ -1167,7 +1150,7 @@ def parse_orch_by_node(it, filter_orch_last=False):
                         parse_action(name, step, orch=orch_name,
                                      stage=stage, jid=jid)
                     else:
-                        for node, actions in orch_steps.items():
+                        for node, actions in list(orch_steps.items()):
                             if not isinstance(actions, dict):
                                 continue
                             parse_actions(node, actions, orch=orch_name,
@@ -1243,7 +1226,7 @@ class CmdBase(Cmd):
         self.interactive = True
 
         if self.intro:
-            print(self.intro)
+            print((self.intro))
 
         while True:
             try:
@@ -1424,7 +1407,7 @@ class CmdBase(Cmd):
         return eval(code, {'root': gl['caasp_cmd']}, {})
 
     def do_eval(self, line):
-        print(self.eval(line))
+        print((self.eval(line)))
 
     def emptyline(self):
         # ignore empty lines instead of repeating last command
@@ -1592,7 +1575,7 @@ class CaaSPEvents(CmdBase):
         '''
         kwargs = get_assign_from_str(line)
         for line in self._get_filtered_data(**kwargs):
-            print(json.dumps(line, indent=4, sort_keys=True))
+            print((json.dumps(line, indent=4, sort_keys=True)))
 
     def do_yaml(self, line):
         '''
@@ -1611,7 +1594,7 @@ class CaaSPEvents(CmdBase):
         '''
         kwargs = get_assign_from_str(line)
         for line in self._get_filtered_data(**kwargs):
-            print(yaml.safe_dump(line, indent=4))
+            print((yaml.safe_dump(line, indent=4)))
 
     def do_plot(self, line):
         '''
@@ -1984,7 +1967,7 @@ class CaaSPMinions(CmdBase):
         Print the number of minions accepted so far.
         '''
         log.info('Number of minions accepted')
-        print(get_salt_keys_accepted_num())
+        print((get_salt_keys_accepted_num()))
 
     def do_accept(self, line):
         '''
@@ -2221,7 +2204,7 @@ class CaaSPContainers(CmdBase):
             raise CommandError('needs a container name')
 
         name = line.strip()
-        print(get_cid(name))
+        print((get_cid(name)))
 
     def do_exec(self, line):
         '''
@@ -2458,7 +2441,7 @@ class CaaSP(CmdBase):
 
             log.info('Making the FS read-writeable (with snapshot=%d)',
                      last_snapshot_num)
-            cmd = SCRIP_REMOUNT_RW.format(num=last_snapshot_num)
+            cmd = SCRIPT_REMOUNT_RW.format(num=last_snapshot_num)
             log.debug('using script: %s', cmd)
             print_iterator(execute(cmd))
         else:

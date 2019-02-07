@@ -60,6 +60,9 @@ DEFAULT_TF_OUTPUTS = 'terraform-outputs.tf'
 DEFAULT_TFVARS_DIR = 'terraform'
 DEFAULT_TF_DEVEL_PROFILE = os.path.join(DEFAULT_TFVARS_DIR, 'profile-devel.tf')
 
+# default Terraform parallelist
+DEFAULT_TF_PAR = 1
+
 # directory where the kubeconfig can be fodun in the remote machines
 DEFAULT_KUBECONFIG_REM = '/root/.kube/config'
 
@@ -78,8 +81,11 @@ DEFAULT_RPMS_DST = '/tmp/caasp-rpms'
 # Notes: follows symlinks
 DEFAULT_RSYNC_ARGS = "-avz -L --delete --delete-after --force"
 
+# directory for images configuration
+DEFAULT_IMGAGES_CFG_DIR = 'configs/images'
+
 # default environments directory
-DEFAULT_ENV_DIR = 'environments'
+DEFAULT_ENV_DIR = 'configs/environments'
 
 # the default environment
 DEFAULT_ENV = 'localhost'
@@ -87,6 +93,9 @@ DEFAULT_ENV = 'localhost'
 # logging format
 # https://docs.python.org/2/library/logging.html#logrecord-attributes
 FORMAT = '# %(asctime)s [%(levelname)s] %(message)s'
+
+CAASP_USER_DIR = os.path.expanduser('~/.caasp')
+CAASP_LAST_RUN_ARGS = os.path.join(CAASP_USER_DIR, 'caasp.yaml')
 
 # default ssh arguments
 SSH_ARGS = """\
@@ -325,7 +334,7 @@ parser.add_argument('args',
                     help=';-separated list of commands to run (get more info with "help")')
 
 env_group = parser.add_argument_group(
-    title='Environment',
+    title='Environment and images',
     description='Environments for running the cluster')
 env_group.add_argument('--env',
                        dest='env',
@@ -337,6 +346,20 @@ env_group.add_argument('--env-dir',
                        metavar='DIR',
                        default=DEFAULT_ENV_DIR,
                        help='environments directory')
+env_group.add_argument('--last-env',
+                       dest='last_env',
+                       action='store_true',
+                       default=False,
+                       help='use the same environment used the last time')
+
+img_group = parser.add_argument_group(
+    title='Images',
+    description='Images to use in the cluster')
+img_group.add_argument('--image',
+                       dest='image',
+                       metavar='IMAGE',
+                       default='',
+                       help='image channel to use')
 
 vms_group = parser.add_argument_group(
     title='Virtual machines',
@@ -388,6 +411,11 @@ tf_group.add_argument('--tfvars',
                       metavar='FILE',
                       default=[],
                       help='add a terraform variables file.')
+tf_group.add_argument('--tf-par',
+                      dest='tf_par',
+                      default=DEFAULT_TF_PAR,
+                      metavar='NUM',
+                      help='Terraform parallelism')
 
 prio_group = parser.add_argument_group(
     title='Privileges/passwords',
@@ -628,6 +656,33 @@ def get_local_ip_for(remote_ip='10.255.255.255'):
     finally:
         s.close()
     return IP
+
+
+def load_caasp_last_run():
+    if not os.path.exists(CAASP_USER_DIR):
+        log.debug('Creating %s', CAASP_USER_DIR)
+        os.makedirs(CAASP_USER_DIR)
+
+    if os.path.exists(CAASP_LAST_RUN_ARGS):
+        import yaml
+
+        log.debug('Loading %s', CAASP_LAST_RUN_ARGS)
+        with open(CAASP_LAST_RUN_ARGS, 'r') as stream:
+            try:
+                return yaml.load(stream)
+            except yaml.YAMLError as exc:
+                log.error('could not load saved args: %s',exc)
+
+
+def save_caasp_last_run(saved_args):
+    if not os.path.exists(CAASP_USER_DIR):
+        log.debug('Creating %s', CAASP_USER_DIR)
+        os.makedirs(CAASP_USER_DIR)
+
+    import yaml
+    with open(CAASP_LAST_RUN_ARGS, 'w') as outfile:
+        log.debug('Saving %s', CAASP_LAST_RUN_ARGS)
+        yaml.dump(saved_args, outfile, default_flow_style=False)
 
 
 def value_to_native(val):
@@ -978,8 +1033,14 @@ def run_tf(subcmd, extra='', vars={}, vars_files=[], outputs=[], tf_state=None, 
     vars_str = ''
     var_files_str = ''
 
-    log.debug(
-        'terraform: trying to find presets files to autoload in %s...', workdir)
+    if len(args.image) > 0:
+        log.debug('terraform: trying to load presets for image %s...', args.image)
+        try_file = os.path.abspath(os.path.join(DEFAULT_IMGAGES_CFG_DIR, "{}.tfvars".format(args.image)))
+        if os.path.exists(try_file):
+            log.debug('tfvars: adding image configuration file: %s', try_file)
+            var_files_str += ' -var-file={}'.format(try_file)
+
+    log.debug('terraform: trying to find presets files to autoload in %s...', workdir)
     for try_file in ENV_TFVARS_FILES:
         try_file = os.path.abspath(os.path.join(workdir, try_file))
         if os.path.exists(try_file) and try_file not in vars_files:
@@ -1039,6 +1100,7 @@ def run_tf(subcmd, extra='', vars={}, vars_files=[], outputs=[], tf_state=None, 
 
     with cd(CURR_DIR):
         log.debug('terraform: running command: %s', cmd)
+        yield from run('terraform init', timeout=timeout)
         yield from run(cmd, timeout=timeout)
 
 
@@ -1072,8 +1134,13 @@ def tf_create(vars={}, vars_files=[], outputs=[], **kwargs):
 
     tf_save_statex(vars, vars_files)
 
+    cmd = 'apply -auto-approve'
+    if len(args.tf_par) > 0:
+        log.warning('terraform: using {} parallelism'.format(args.tf_par))
+        cmd += ' -parallelism={}'.format(args.tf_par)
+
     try:
-        yield from run_tf('apply', vars=vars, vars_files=vars_files, outputs=outputs)
+        yield from run_tf(cmd, vars=vars, vars_files=vars_files, outputs=outputs)
     except subprocess.CalledProcessError as e:
         raise TerraformError('terraform: construction error: {}\n'.format(e))
 
@@ -1501,14 +1568,18 @@ def get_cid(vm, name):
     raise InvalidMachineError('could not find container-id for {}'.format(vm))
 
 
-def sync_hwtime():
+def sync_hwtime(vm=None, **kwargs):
     '''
     Synchronize the clock between the VMs and the Host
 
     This is specially important after suspend/resume operations,
     as this can lead to some certificates beeing invalid.
     '''
-    run_ssh_all('/sbin/hwclock --hctosys')
+    cmd = '/sbin/hwclock --hctosys'
+    if vm:
+        print_iterator(run_ssh_cmd(vm, cmd, **kwargs))
+    else:
+        run_ssh_all(cmd, **kwargs)
 
 
 ####################################################################
@@ -2056,6 +2127,7 @@ def _reg_del_certs():
             log.debug('Removing %s', filename)
             os.remove(filename)
 
+
 def _reg_refresh_nodes(ip=None):
     registry_hostname = args.reg_hostname
 
@@ -2164,7 +2236,8 @@ def registry_import(image_name, image_hash=None, registry='localhost', port=REGI
     if not image_hash:
         name, tag = image_name.split(':')
         log.debug('Getting the hash for image %s', name)
-        cmd = "docker images | grep " + name + " | grep " + tag + " | awk '{ print $3 }'"
+        cmd = "docker images | grep " + name + \
+            " | grep " + tag + " | awk '{ print $3 }'"
         output = list(run(cmd))
         image_hash = output[0].strip()
 
@@ -3060,6 +3133,7 @@ class CaaSPCluster(CmdBase):
 
         * `running`: resume the machine after rolling back.
         * `name`: rollback to the snapshot named `name`
+        * `vm`: rollback only a particular VM
         '''
         kwargs = {'running': True}
         kwargs.update(get_assign_from_str(line))
@@ -3069,14 +3143,22 @@ class CaaSPCluster(CmdBase):
                              post_msg='Cluster rolled back',
                              icon='undo'):
 
+            vm = kwargs.pop('vm', None)
             post_running = kwargs.pop('running', True)
+            if vm:
+                log.info('Rolling back %s', vm)
+                real_vm = tf_find_for(vm)
+                print_iterator(virsh_rollback_for_vm(real_vm, post_running=post_running, **kwargs))
+                # make sure the VMs are running: otherwise, refresh will fail
+                print_iterator(virsh_resume_for_vm(real_vm))
+            else:
+                log.info('Rolling back all the VMs')
+                map_all_vms_par(virsh_rollback_for_vm,
+                                post_running=post_running, **kwargs)
+                map_all_vms_par(virsh_resume_for_vm)
+                print_iterator(tf_refresh())
 
-            map_all_vms_par(virsh_rollback_for_vm,
-                            post_running=post_running, **kwargs)
-            # make sure the VMs are running: otherwise, refresh will fail
-            map_all_vms_par(virsh_resume_for_vm)
-            print_iterator(tf_refresh())
-            sync_hwtime()
+            sync_hwtime(ignore_errors=True)
 
     def do_power_on(self, line):
         '''
@@ -4167,37 +4249,45 @@ class CaaSP(CmdBase):
 
 
 if __name__ == '__main__':
-    caasp_cmd = CaaSP()
+    saved_args = load_caasp_last_run()
+    if args.last_env:
+        args.env = saved_args['env']
 
-    if not args.skip_rc_files:
-        log.debug('trying to load RC files')
-        caasp_cmd.try_rc_files(
-            CAASP_RC_FILES + CAASP_RC_FILES_ABS, directory=CURR_DIR)
-        caasp_cmd.try_rc_files(CAASP_RC_FILES, directory=get_work_dir())
+    try:
+        caasp_cmd = CaaSP()
 
-    if len(args.args) > 0 and args.commands_pre:
-        caasp_cmd.command_line_args(args.args)
+        if not args.skip_rc_files:
+            log.debug('trying to load RC files')
+            caasp_cmd.try_rc_files(
+                CAASP_RC_FILES + CAASP_RC_FILES_ABS, directory=CURR_DIR)
+            caasp_cmd.try_rc_files(CAASP_RC_FILES, directory=get_work_dir())
 
-    if args.script:
-        if args.script_begin:
-            log.info('Will start execution at stage "%s"', args.script_begin)
-            caasp_cmd.blocked = True
+        if len(args.args) > 0 and args.commands_pre:
+            caasp_cmd.command_line_args(args.args)
 
-        for script in args.script:
-            try:
-                caasp_cmd.load_script(script)
-            except Exception as e:
-                log.critical('Could not read file %s: %s', script, e)
-                sys.exit(1)
+        if args.script:
+            if args.script_begin:
+                log.info('Will start execution at stage "%s"', args.script_begin)
+                caasp_cmd.blocked = True
 
-        caasp_cmd.blocked = False
+            for script in args.script:
+                try:
+                    caasp_cmd.load_script(script)
+                except Exception as e:
+                    log.critical('Could not read file %s: %s', script, e)
+                    sys.exit(1)
 
-        if args.script_only:
-            log.debug('we were running only scripts: exitting...')
-            sys.exit(0)
+            caasp_cmd.blocked = False
 
-    if len(args.args) > 0 and not args.commands_pre:
-        caasp_cmd.command_line_args(args.args)
+            if args.script_only:
+                log.debug('we were running only scripts: exitting...')
+                sys.exit(0)
 
-    if not args.args or args.loop:
-        caasp_cmd.cmdloop()
+        if len(args.args) > 0 and not args.commands_pre:
+            caasp_cmd.command_line_args(args.args)
+
+        if not args.args or args.loop:
+            caasp_cmd.cmdloop()
+
+    finally:
+        save_caasp_last_run({'env': args.env})
